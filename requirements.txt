@@ -1,0 +1,6 @@
+flask
+supabase
+google-generativeai
+python-dotenv
+pytz
+requests

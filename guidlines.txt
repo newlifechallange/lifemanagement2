@@ -1,0 +1,99 @@
+Technical Directive: "LifeOS" Desktop MVP (PyQt6 + SQLite)
+Role: Act as a Senior Software Engineer. Objective: Build a standalone Desktop Application using Python and PyQt6 that serves as the MVP for the "Life Operating System".
+Stack: Python, PyQt6 (GUI), SQLite (Local DB), Google Gemini API (Flash 2.0).
+
+1. Core Concept
+The application is a Desktop Chat Interface that mimics the future WhatsApp bot. It acts as an intelligent autobiographer.
+*   **MVP Scope:** Focus on Logic validation, Data Structure, and AI Interaction flow.
+*   **Future Scope:** Port logic to Flask/Fonnte/Supabase after MVP validation.
+
+2. System Architecture
+A. Database (SQLite - `lifeos.db`)
+Use SQLAlchemy for ORM.
+1.  **User** (Single user for MVP, but keep schema extensible)
+2.  **Attribute** (Key-Value Store for State: Weight, Mood, etc.)
+3.  **TimeLog** (Activity Journal: Start, End, Duration, Category)
+
+B. The Logic Core ("The Brain")
+A Python class `LifeOSCore` that handles:
+1.  **Conversation History:** Store the last **5 exchanges** (User Message + AI Response). This is CRITICAL for handling corrections (e.g., "I meant 55kg", "Actually it was 8pm").
+2.  **Context Loading:** Fetch last 10 TimeLogs + Current Attributes + Last 5 Chat History.
+3.  **LLM Processing:** Send [System Prompt + Context + History + User Input] to Gemini.
+4.  **Action Execution:** Parse JSON output from Gemini to `LOG_TIME` or `UPDATE_STATE` in SQLite.
+
+C. User Interface (PyQt6)
+*   **Main Window:** A clean, modern chat interface.
+*   **Chat History Area:** Displays the conversation (User right, AI left).
+*   **Input Field:** Text box for user messages.
+*   **Status/Debug Panel:** Optional side panel showing "Current State" (Weight, etc.) to visualize DB changes in real-time.
+
+3. Key Features & Logic
+A. Conversation History (Context Awareness)
+*   **Requirement:** The AI must understand corrections.
+*   **Example:**
+    *   User: "I weigh 56kg" -> AI: "Confirming 56kg?" -> User: "Oh i mean 55 sorry typo"
+    *   The AI must see the previous turn to know "55" replaces "56".
+
+B. Time Logging & Gap Detection
+*   **Parse Time:** STRICTLY ask for clarification first. Do not assume "now". Use **Asia/Jakarta (WIB)**.
+*   **Gap Logic:** If (New Activity Start - Last Activity End) > 30 mins -> Ask "What happened in the gap?".
+
+C. State Management
+*   **Verify First:** If user says "Weight 70kg", check if 'weight' exists.
+    *   If exists: "Update from X to 70?"
+    *   If new: "Start tracking weight at 70?"
+
+D. Categories (Mandatory)
+*   Every TimeLog MUST be classified into one of these strict categories:
+    *   **Work**
+    *   **Chore**
+    *   **Romantic**
+    *   **Rest**
+    *   **Entertainment**
+    *   **Others**
+
+E. Analytics (Intent C)
+*   Handle questions like "Do I have a habit?" or "Average sleep?".
+*   Fetch aggregations from SQLite and answer with data.
+
+E. Delete / Undo (Intent D)
+*   **Requirement:** Allow user to remove erroneous entries ("Delete that last log", "Undo the weight update").
+*   **Safety:**
+    *   **Identify:** Find the specific target record (e.g., "Last TimeLog" or "Attribute: Weight").
+    *   **Confirm:** ALWAYS ask: "Are you sure you want to delete [Record Details]?"
+    *   **Execute:** Only delete from SQLite after user confirms "Yes".
+
+F. Future Planning (Intent F)
+*   **Goal:** capture future intentions ("I will go to the gym at 5pm").
+*   **Storage:** Save as `FuturePlan` (Status: Pending).
+*   **Visibility:** Display upcoming plans in the Status Panel.
+*   **Completion:** Users can say "I did the gym plan" -> System moves it from `FuturePlan` (Completed) to `TimeLog` (Actual History).
+
+4. Gemini System Instruction (Prompt Engineering)
+You are LifeOS, a desktop personal assistant.
+Timezone: Asia/Jakarta (WIB).
+
+**Context:**
+[Last 5 Chat Turns]
+[Current Attributes]
+[Last 3 Activities]
+
+**Task:**
+1. Analyze user input considering the Chat History (for corrections).
+2. If time duration is given, ASK to confirm start/end times.
+3. If specific state is given, ASK to confirm updates.
+4. If Gap > 30 mins detected in timeline, ASK about it.
+
+**Output Format (JSON):**
+{
+  "response_text": "Message to show user",
+  "action": "LOG_TIME" | "UPDATE_STATE" | "NONE",
+  "data": { ...structured data... }
+}
+
+5. Development Roadmap (MVP)
+Step 1: Setup Project (VirtualEnv, `requirements.txt`: PyQt6, SQLAlchemy, google-generativeai).
+Step 2: Database Models (SQLAlchemy + SQLite).
+Step 3: `LifeOSCore` Logic (Gemini integration, History Buffer, State Management).
+Step 4: PyQt6 UI (Chat Window, Input, rendering messages).
+Step 5: Connect UI to Logic and Test.

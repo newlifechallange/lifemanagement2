@@ -1,0 +1,247 @@
+import os
+import json
+import datetime
+import pytz
+import google.generativeai as genai
+from db_client import supabase
+from dotenv import load_dotenv
+
+load_dotenv()
+
+WIB = pytz.timezone('Asia/Jakarta')
+
+class LifeOSCore:
+    def __init__(self):
+        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+        self.model = genai.GenerativeModel('gemini-flash-latest')
+        self.histories = {} # Dict to store history per user: {user_id: [messages]}
+
+    def get_or_create_user(self, phone_number: str, name: str):
+        # Try to find user
+        response = supabase.table('users').select("*").eq('phone_number', phone_number).execute()
+        if response.data:
+            return response.data[0]
+        
+        # Create user if not exists
+        new_user = {
+            "phone_number": phone_number,
+            "name": name,
+            "timezone": "Asia/Jakarta"
+        }
+        response = supabase.table('users').insert(new_user).execute()
+        return response.data[0]
+
+    def get_context(self, user_id: int):
+        # Fetch last 3 activities
+        log_res = supabase.table('timelogs').select("*").eq('user_id', user_id).order('end_time', desc=True).limit(3).execute()
+        logs = log_res.data
+        
+        # Parse timestamps for context
+        log_context = []
+        for l in logs:
+            # Handle string timestamps from JSON API
+            start = datetime.datetime.fromisoformat(l['start_time'].replace('Z', '+00:00')).astimezone(WIB)
+            end = datetime.datetime.fromisoformat(l['end_time'].replace('Z', '+00:00')).astimezone(WIB)
+            log_context.append({
+                "activity": l['activity'],
+                "start": start.strftime("%H:%M"),
+                "end": end.strftime("%H:%M")
+            })
+
+        # Fetch current attributes
+        attr_res = supabase.table('attributes').select("*").eq('user_id', user_id).execute()
+        attr_context = {a['key']: {"value": a['value'], "unit": a['unit']} for a in attr_res.data}
+
+        # Fetch pending plans
+        plan_res = supabase.table('future_plans').select("*").eq('user_id', user_id).eq('status', 'pending').execute()
+        plan_context = []
+        for p in plan_res.data:
+             planned = datetime.datetime.fromisoformat(p['planned_start'].replace('Z', '+00:00')).astimezone(WIB)
+             plan_context.append({
+                 "id": p['id'],
+                 "activity": p['activity'],
+                 "when": planned.strftime("%Y-%m-%d %H:%M")
+             })
+
+        return log_context, attr_context, plan_context
+
+    def process_message(self, user_input, phone_number, user_name):
+        try:
+            user = self.get_or_create_user(phone_number, user_name)
+            user_id = user['id']
+
+            # Initialize history
+            if user_id not in self.histories:
+                self.histories[user_id] = []
+
+            log_context, attr_context, plan_context = self.get_context(user_id)
+            current_time = datetime.datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S")
+
+            system_instruction = f"""
+            You are LifeOS, a personal assistant. Timezone: Asia/Jakarta (WIB).
+            Current Date/Time: {current_time}
+            User: {user_name}
+
+            Context:
+            - Last 3 Activities: {json.dumps(log_context)}
+            - Current Attributes: {json.dumps(attr_context)}
+            - Upcoming Plans: {json.dumps(plan_context)}
+            - Chat History (last 5 turns): {json.dumps(self.histories[user_id])}
+
+            Rules:
+            1. Activities: If user mentions past activity, ASK to confirm time, then LOG_TIME.
+            2. Plans: If user mentions FUTURE activity (e.g., "I will gym at 5pm"), ASK to confirm, then PLAN_ACTIVITY.
+            3. Completion: If user says they DID a planned activity, use LOG_TIME and explicitly mention the plan_id in data to mark it complete.
+            4. State: If user mentions state (weight), verify then UPDATE_STATE.
+            5. Gaps: Check for >30min gaps between last activity and new activity start.
+            6. Corrections: Handle typos using history.
+            7. Categorization: EVERY activity must be classified into exactly one of: Work, Chore, Romantic, Rest, Entertainment, Others.
+
+            Output Format (JSON ONLY):
+            {{
+              "response_text": "Friendly message",
+              "action": "LOG_TIME" | "UPDATE_STATE" | "PLAN_ACTIVITY" | "DELETE" | "QUERY" | "NONE",
+              "data": {{
+                "activity": "string", 
+                "start_time": "ISO_TIMESTAMP", 
+                "end_time": "ISO_TIMESTAMP", 
+                "category": "Work" | "Chore" | "Romantic" | "Rest" | "Entertainment" | "Others",
+                "key": "attribute_key",
+                "value": "string_or_num",
+                "unit": "string",
+                "notes": "string",
+                "type": "timelog|attribute|plan",
+                "id": "integer_id"
+              }}
+            }}
+            Only include relevant keys in "data". Use current date {datetime.datetime.now(WIB).strftime("%Y-%m-%d")} for timestamps.
+            """
+
+            response = self.model.generate_content([system_instruction, user_input])
+            res_text = response.text.strip()
+            if res_text.startswith("```json"):
+                res_text = res_text[7:-3].strip()
+            
+            result = json.loads(res_text)
+            
+            # Execute Actions
+            action = result.get("action")
+            data = result.get("data", {})
+            
+            if action == "LOG_TIME" and data:
+                self.execute_log_time(user_id, data)
+            elif action == "UPDATE_STATE" and data:
+                self.execute_update_state(user_id, data)
+            elif action == "PLAN_ACTIVITY" and data:
+                self.execute_plan_activity(user_id, data)
+            elif action == "DELETE" and data:
+                self.execute_delete(user_id, data)
+
+            # Update history
+            self.histories[user_id].append({"role": "user", "content": user_input})
+            self.histories[user_id].append({"role": "assistant", "content": result['response_text']})
+            if len(self.histories[user_id]) > 10:
+                self.histories[user_id] = self.histories[user_id][-10:]
+
+            return result
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return {"response_text": f"Error: {str(e)}", "action": "NONE", "data": {}}
+
+    def execute_plan_activity(self, user_id, data):
+        try:
+            new_plan = {
+                "user_id": user_id,
+                "activity": data['activity'],
+                "planned_start": data['start_time'],
+                "planned_end": data.get('end_time'),
+                "status": 'pending'
+            }
+            supabase.table('future_plans').insert(new_plan).execute()
+        except Exception as e:
+            print(f"Failed to plan activity: {e}")
+
+    def execute_log_time(self, user_id, data):
+        try:
+            start = datetime.datetime.fromisoformat(data['start_time'])
+            end = datetime.datetime.fromisoformat(data['end_time'])
+            duration = int((end - start).total_seconds() / 60)
+            
+            new_log = {
+                "user_id": user_id,
+                "activity": data['activity'],
+                "start_time": data['start_time'],
+                "end_time": data['end_time'],
+                "duration_minutes": duration,
+                "category": data.get('category')
+            }
+            supabase.table('timelogs').insert(new_log).execute()
+            
+            if 'id' in data and data.get('type') == 'plan':
+                 supabase.table('future_plans').update({"status": "completed"}).eq('id', data['id']).execute()
+
+        except Exception as e:
+            print(f"Failed to log time: {e}")
+
+    def execute_update_state(self, user_id, data):
+        try:
+            # Upsert logic manually since we are tracking keys per user
+            # First check if exists
+            existing = supabase.table('attributes').select("*").eq('user_id', user_id).eq('key', data['key']).execute()
+            
+            if existing.data:
+                # Update
+                attr_id = existing.data[0]['id']
+                update_data = {
+                    "value": str(data['value']),
+                    "unit": data.get('unit'),
+                    "notes": data.get('notes'),
+                    "updated_at": datetime.datetime.now(WIB).isoformat()
+                }
+                supabase.table('attributes').update(update_data).eq('id', attr_id).execute()
+            else:
+                # Insert
+                new_attr = {
+                    "user_id": user_id,
+                    "key": data['key'],
+                    "value": str(data['value']),
+                    "unit": data.get('unit'),
+                    "notes": data.get('notes')
+                }
+                supabase.table('attributes').insert(new_attr).execute()
+            
+            # --- LOG HISTORY ---
+            history_entry = {
+                "user_id": user_id,
+                "key": data['key'],
+                "value": str(data['value']),
+                "unit": data.get('unit'),
+                "notes": data.get('notes'),
+                "recorded_at": datetime.datetime.now(WIB).isoformat()
+            }
+            supabase.table('attribute_history').insert(history_entry).execute()
+            
+        except Exception as e:
+            print(f"Failed to update state: {e}")
+
+    def execute_delete(self, user_id, data):
+        try:
+            table = ""
+            if data.get('type') == 'timelog':
+                table = 'timelogs'
+            elif data.get('type') == 'attribute':
+                table = 'attributes'
+                # Attributes are deleted by key in our logic, but here we might receive ID. 
+                # If key is provided:
+                if 'key' in data:
+                    supabase.table(table).delete().eq('user_id', user_id).eq('key', data['key']).execute()
+                    return
+            elif data.get('type') == 'plan':
+                table = 'future_plans'
+            
+            if table and 'id' in data:
+                supabase.table(table).delete().eq('id', data['id']).eq('user_id', user_id).execute()
+
+        except Exception as e:
+            print(f"Failed to delete: {e}")
