@@ -50,6 +50,7 @@ class LifeOSCore:
                 "id": l['id'],
                 "activity": l['activity'],
                 "category": l.get('category'), # Add category for summary
+                "tag": l.get('tag'),
                 "start": start.strftime("%H:%M"),
                 "end": end.strftime("%H:%M"),
                 "minutes": l['duration_minutes']
@@ -70,7 +71,20 @@ class LifeOSCore:
                  "when": planned.strftime("%Y-%m-%d %H:%M")
              })
 
-        return log_context, attr_context, plan_context
+        # Fetch Attribute History (Last 50 entries) for context
+        hist_res = supabase.table('attribute_history').select("*").eq('user_id', user_id).order('recorded_at', desc=True).limit(50).execute()
+        history_context = []
+        for h in hist_res.data:
+            rec = datetime.datetime.fromisoformat(h['recorded_at'].replace('Z', '+00:00')).astimezone(WIB)
+            history_context.append({
+                "key": h['key'],
+                "value": h['value'],
+                "unit": h['unit'],
+                "date": rec.strftime("%Y-%m-%d"),
+                "notes": h.get('notes')
+            })
+
+        return log_context, attr_context, plan_context, history_context
 
     def process_message(self, user_input, phone_number, user_name):
         try:
@@ -81,7 +95,7 @@ class LifeOSCore:
             if user_id not in self.histories:
                 self.histories[user_id] = []
 
-            log_context, attr_context, plan_context = self.get_context(user_id)
+            log_context, attr_context, plan_context, history_context = self.get_context(user_id)
             current_time = datetime.datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S")
 
             system_instruction = f"""
@@ -92,6 +106,7 @@ class LifeOSCore:
             Context:
             - Today's Activity Logs (Since Midnight): {json.dumps(log_context)}
             - Current Attributes: {json.dumps(attr_context)}
+            - Attribute History (Past changes): {json.dumps(history_context)}
             - Upcoming Plans: {json.dumps(plan_context)}
             - Chat History (last 5 turns): {json.dumps(self.histories[user_id])}
 
@@ -105,6 +120,8 @@ class LifeOSCore:
             7. Categorization: EVERY activity must be classified into exactly one of: Work, Chore, Romantic, Rest, Entertainment, Others.
             8. Queries: The user may ask for summaries (e.g., "How long did I work?"). Calculate this YOURSELF from "Today's Activity Logs" context. Sum the 'minutes' for matching categories/activities. If no logs exist, say so.
             9. Deletion: If user asks to delete/remove something, use DELETE action. For attributes, provide "key". For logs or plans, provide "id" (found in Context).
+            10. Tags: If user specifies a tag (e.g. "project:1"), extract it.
+            11. Intervals: If user describes interleaved time (e.g., "3 hours work, 5 min break every 30m"), DO NOT log every single interval. Calculate TOTAL WORK duration and TOTAL REST duration. Log them as two separate, consecutive entries. Add a note "Aggregated from intervals".
 
             Output Format (JSON ONLY):
             {{
@@ -117,6 +134,7 @@ class LifeOSCore:
                     "start_time": "ISO_TIMESTAMP", 
                     "end_time": "ISO_TIMESTAMP", 
                     "category": "Work" | "Chore" | "Romantic" | "Rest" | "Entertainment" | "Others",
+                    "tag": "string",
                     "key": "attribute_key",
                     "value": "string_or_num",
                     "unit": "string",
@@ -193,7 +211,9 @@ class LifeOSCore:
                 "start_time": data['start_time'],
                 "end_time": data['end_time'],
                 "duration_minutes": duration,
-                "category": data.get('category')
+                "category": data.get('category'),
+                "tag": data.get('tag'),
+                "notes": data.get('notes')
             }
             supabase.table('timelogs').insert(new_log).execute()
             
