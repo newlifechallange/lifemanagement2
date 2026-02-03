@@ -32,8 +32,12 @@ class LifeOSCore:
         return response.data[0]
 
     def get_context(self, user_id: int):
-        # Fetch last 3 activities
-        log_res = supabase.table('timelogs').select("*").eq('user_id', user_id).order('end_time', desc=True).limit(3).execute()
+        # Fetch logs for TODAY (since midnight WIB)
+        now_wib = datetime.datetime.now(WIB)
+        start_of_day = now_wib.replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        # Supabase expects ISO string for comparison
+        log_res = supabase.table('timelogs').select("*").eq('user_id', user_id).gte('start_time', start_of_day.isoformat()).order('start_time', desc=True).execute()
         logs = log_res.data
         
         # Parse timestamps for context
@@ -43,14 +47,17 @@ class LifeOSCore:
             start = datetime.datetime.fromisoformat(l['start_time'].replace('Z', '+00:00')).astimezone(WIB)
             end = datetime.datetime.fromisoformat(l['end_time'].replace('Z', '+00:00')).astimezone(WIB)
             log_context.append({
+                "id": l['id'],
                 "activity": l['activity'],
+                "category": l.get('category'), # Add category for summary
                 "start": start.strftime("%H:%M"),
-                "end": end.strftime("%H:%M")
+                "end": end.strftime("%H:%M"),
+                "minutes": l['duration_minutes']
             })
 
         # Fetch current attributes
         attr_res = supabase.table('attributes').select("*").eq('user_id', user_id).execute()
-        attr_context = {a['key']: {"value": a['value'], "unit": a['unit']} for a in attr_res.data}
+        attr_context = {a['key']: {"value": a['value'], "unit": a['unit'], "notes": a.get('notes')} for a in attr_res.data}
 
         # Fetch pending plans
         plan_res = supabase.table('future_plans').select("*").eq('user_id', user_id).eq('status', 'pending').execute()
@@ -83,7 +90,7 @@ class LifeOSCore:
             User: {user_name}
 
             Context:
-            - Last 3 Activities: {json.dumps(log_context)}
+            - Today's Activity Logs (Since Midnight): {json.dumps(log_context)}
             - Current Attributes: {json.dumps(attr_context)}
             - Upcoming Plans: {json.dumps(plan_context)}
             - Chat History (last 5 turns): {json.dumps(self.histories[user_id])}
@@ -96,23 +103,29 @@ class LifeOSCore:
             5. Gaps: Check for >30min gaps between last activity and new activity start.
             6. Corrections: Handle typos using history.
             7. Categorization: EVERY activity must be classified into exactly one of: Work, Chore, Romantic, Rest, Entertainment, Others.
+            8. Queries: The user may ask for summaries (e.g., "How long did I work?"). Calculate this YOURSELF from "Today's Activity Logs" context. Sum the 'minutes' for matching categories/activities. If no logs exist, say so.
+            9. Deletion: If user asks to delete/remove something, use DELETE action. For attributes, provide "key". For logs or plans, provide "id" (found in Context).
 
             Output Format (JSON ONLY):
             {{
-              "response_text": "Friendly message",
-              "action": "LOG_TIME" | "UPDATE_STATE" | "PLAN_ACTIVITY" | "DELETE" | "QUERY" | "NONE",
-              "data": {{
-                "activity": "string", 
-                "start_time": "ISO_TIMESTAMP", 
-                "end_time": "ISO_TIMESTAMP", 
-                "category": "Work" | "Chore" | "Romantic" | "Rest" | "Entertainment" | "Others",
-                "key": "attribute_key",
-                "value": "string_or_num",
-                "unit": "string",
-                "notes": "string",
-                "type": "timelog|attribute|plan",
-                "id": "integer_id"
-              }}
+              "response_text": "Friendly message answering the user or confirming action",
+              "actions": [
+                {{
+                  "type": "LOG_TIME" | "UPDATE_STATE" | "PLAN_ACTIVITY" | "DELETE" | "QUERY",
+                  "data": {{
+                    "activity": "string", 
+                    "start_time": "ISO_TIMESTAMP", 
+                    "end_time": "ISO_TIMESTAMP", 
+                    "category": "Work" | "Chore" | "Romantic" | "Rest" | "Entertainment" | "Others",
+                    "key": "attribute_key",
+                    "value": "string_or_num",
+                    "unit": "string",
+                    "notes": "string",
+                    "type": "timelog|attribute|plan",
+                    "id": "integer_id"
+                  }}
+                }}
+              ]
             }}
             Only include relevant keys in "data". Use current date {datetime.datetime.now(WIB).strftime("%Y-%m-%d")} for timestamps.
             """
@@ -125,17 +138,23 @@ class LifeOSCore:
             result = json.loads(res_text)
             
             # Execute Actions
-            action = result.get("action")
-            data = result.get("data", {})
-            
-            if action == "LOG_TIME" and data:
-                self.execute_log_time(user_id, data)
-            elif action == "UPDATE_STATE" and data:
-                self.execute_update_state(user_id, data)
-            elif action == "PLAN_ACTIVITY" and data:
-                self.execute_plan_activity(user_id, data)
-            elif action == "DELETE" and data:
-                self.execute_delete(user_id, data)
+            actions = result.get("actions", [])
+            # Support legacy single-action format if model slips (optional but safe)
+            if "action" in result and "data" in result and not actions:
+                actions = [{"type": result["action"], "data": result["data"]}]
+
+            for act in actions:
+                action_type = act.get("type")
+                data = act.get("data", {})
+                
+                if action_type == "LOG_TIME" and data:
+                    self.execute_log_time(user_id, data)
+                elif action_type == "UPDATE_STATE" and data:
+                    self.execute_update_state(user_id, data)
+                elif action_type == "PLAN_ACTIVITY" and data:
+                    self.execute_plan_activity(user_id, data)
+                elif action_type == "DELETE" and data:
+                    self.execute_delete(user_id, data)
 
             # Update history
             self.histories[user_id].append({"role": "user", "content": user_input})
