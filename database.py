@@ -35,6 +35,14 @@ class AttributeHistory(Base):
     notes = Column(String, nullable=True)
     recorded_at = Column(DateTime, default=lambda: datetime.datetime.now(WIB))
 
+class ChatHistory(Base):
+    __tablename__ = 'chat_history'
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'))
+    role = Column(String)
+    content = Column(String)
+    created_at = Column(DateTime, default=lambda: datetime.datetime.now(WIB))
+
 class TimeLog(Base):
     __tablename__ = 'timelogs'
     id = Column(Integer, primary_key=True)
