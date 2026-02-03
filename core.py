@@ -14,7 +14,6 @@ class LifeOSCore:
     def __init__(self):
         genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
         self.model = genai.GenerativeModel('gemini-3-flash-preview')
-        self.histories = {} # Dict to store history per user: {user_id: [messages]}
 
     def get_or_create_user(self, phone_number: str, name: str):
         # Try to find user
@@ -84,18 +83,19 @@ class LifeOSCore:
                 "notes": h.get('notes')
             })
 
-        return log_context, attr_context, plan_context, history_context
+        # Fetch Chat History (Last 10 messages / 5 turns)
+        chat_res = supabase.table('chat_history').select("*").eq('user_id', user_id).order('created_at', desc=True).limit(10).execute()
+        # Messages come in reverse order (newest first), reverse them back for context
+        chat_context = [{"role": c['role'], "content": c['content']} for c in reversed(chat_res.data)]
+
+        return log_context, attr_context, plan_context, history_context, chat_context
 
     def process_message(self, user_input, phone_number, user_name):
         try:
             user = self.get_or_create_user(phone_number, user_name)
             user_id = user['id']
 
-            # Initialize history
-            if user_id not in self.histories:
-                self.histories[user_id] = []
-
-            log_context, attr_context, plan_context, history_context = self.get_context(user_id)
+            log_context, attr_context, plan_context, history_context, chat_context = self.get_context(user_id)
             current_time = datetime.datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S")
 
             system_instruction = f"""
@@ -108,7 +108,7 @@ class LifeOSCore:
             - Current Attributes: {json.dumps(attr_context)}
             - Attribute History (Past changes): {json.dumps(history_context)}
             - Upcoming Plans: {json.dumps(plan_context)}
-            - Chat History (last 5 turns): {json.dumps(self.histories[user_id])}
+            - Chat History (last 5 turns): {json.dumps(chat_context)}
 
             Rules:
             1. Activities: If user mentions past activity, ASK to confirm time, then LOG_TIME.
@@ -174,11 +174,22 @@ class LifeOSCore:
                 elif action_type == "DELETE" and data:
                     self.execute_delete(user_id, data)
 
-            # Update history
-            self.histories[user_id].append({"role": "user", "content": user_input})
-            self.histories[user_id].append({"role": "assistant", "content": result['response_text']})
-            if len(self.histories[user_id]) > 10:
-                self.histories[user_id] = self.histories[user_id][-10:]
+            # --- Update Chat History (Persist to DB) ---
+            # 1. User Message
+            supabase.table('chat_history').insert({
+                "user_id": user_id,
+                "role": "user",
+                "content": user_input,
+                "created_at": datetime.datetime.now(WIB).isoformat()
+            }).execute()
+
+            # 2. Assistant Response
+            supabase.table('chat_history').insert({
+                "user_id": user_id,
+                "role": "assistant",
+                "content": result['response_text'],
+                "created_at": datetime.datetime.now(WIB).isoformat()
+            }).execute()
 
             return result
         except Exception as e:
