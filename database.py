@@ -44,6 +44,8 @@ class TimeLog(Base):
     end_time = Column(DateTime)
     duration_minutes = Column(Integer)
     category = Column(String, nullable=True)
+    tag = Column(String, nullable=True)
+    notes = Column(String, nullable=True)
 
 class FuturePlan(Base):
     __tablename__ = 'future_plans'
