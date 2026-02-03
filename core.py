@@ -13,7 +13,7 @@ WIB = pytz.timezone('Asia/Jakarta')
 class LifeOSCore:
     def __init__(self):
         genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-        self.model = genai.GenerativeModel('gemini-flash-latest')
+        self.model = genai.GenerativeModel('gemini-3-flash-preview')
         self.histories = {} # Dict to store history per user: {user_id: [messages]}
 
     def get_or_create_user(self, phone_number: str, name: str):
@@ -117,7 +117,7 @@ class LifeOSCore:
             4. State: If user mentions state (weight), verify then UPDATE_STATE.
             5. Gaps: Check for >30min gaps between last activity and new activity start.
             6. Corrections: Handle typos using history.
-            7. Categorization: EVERY activity must be classified into exactly one of: Work, Chore, Romantic, Rest, Entertainment, Others.
+            7. Categorization: Classify into: Work, Chore, Romantic, Rest, Entertainment, Exercise. If none fit, CREATE a new appropriate category (do not use 'Others').
             8. Queries: The user may ask for summaries (e.g., "How long did I work?"). Calculate this YOURSELF from "Today's Activity Logs" context. Sum the 'minutes' for matching categories/activities. If no logs exist, say so.
             9. Deletion: If user asks to delete/remove something, use DELETE action. For attributes, provide "key". For logs or plans, provide "id" (found in Context).
             10. Tags: If user specifies a tag (e.g. "project:1"), extract it.
@@ -133,7 +133,7 @@ class LifeOSCore:
                     "activity": "string", 
                     "start_time": "ISO_TIMESTAMP", 
                     "end_time": "ISO_TIMESTAMP", 
-                    "category": "Work" | "Chore" | "Romantic" | "Rest" | "Entertainment" | "Others",
+                    "category": "Work" | "Chore" | "Romantic" | "Rest" | "Entertainment" | "Exercise" | "CustomString",
                     "tag": "string",
                     "key": "attribute_key",
                     "value": "string_or_num",
