@@ -188,11 +188,23 @@ class LifeOSCore:
 
     def execute_plan_activity(self, user_id, data):
         try:
+            # Parse AI time. If naive, assume WIB.
+            start = datetime.datetime.fromisoformat(data['start_time'])
+            if start.tzinfo is None:
+                start = WIB.localize(start)
+            
+            end_iso = None
+            if data.get('end_time'):
+                end = datetime.datetime.fromisoformat(data['end_time'])
+                if end.tzinfo is None:
+                    end = WIB.localize(end)
+                end_iso = end.isoformat()
+
             new_plan = {
                 "user_id": user_id,
                 "activity": data['activity'],
-                "planned_start": data['start_time'],
-                "planned_end": data.get('end_time'),
+                "planned_start": start.isoformat(),
+                "planned_end": end_iso,
                 "status": 'pending'
             }
             supabase.table('future_plans').insert(new_plan).execute()
@@ -201,15 +213,22 @@ class LifeOSCore:
 
     def execute_log_time(self, user_id, data):
         try:
+            # Parse AI time. If naive, assume WIB.
             start = datetime.datetime.fromisoformat(data['start_time'])
+            if start.tzinfo is None:
+                start = WIB.localize(start)
+            
             end = datetime.datetime.fromisoformat(data['end_time'])
+            if end.tzinfo is None:
+                end = WIB.localize(end)
+
             duration = int((end - start).total_seconds() / 60)
             
             new_log = {
                 "user_id": user_id,
                 "activity": data['activity'],
-                "start_time": data['start_time'],
-                "end_time": data['end_time'],
+                "start_time": start.isoformat(),
+                "end_time": end.isoformat(),
                 "duration_minutes": duration,
                 "category": data.get('category'),
                 "tag": data.get('tag'),
