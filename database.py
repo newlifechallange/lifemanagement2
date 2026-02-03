@@ -13,6 +13,8 @@ class User(Base):
     phone_number = Column(String, unique=True, nullable=True) # Optional for MVP
     name = Column(String)
     timezone = Column(String, default='Asia/Jakarta')
+    current_streak = Column(Integer, default=0)
+    last_active_date = Column(DateTime, nullable=True) # Using DateTime for SQLAlchemy mapping to DATE
     created_at = Column(DateTime, default=lambda: datetime.datetime.now(WIB))
 
 class Attribute(Base):
@@ -42,6 +44,18 @@ class ChatHistory(Base):
     role = Column(String)
     content = Column(String)
     created_at = Column(DateTime, default=lambda: datetime.datetime.now(WIB))
+
+class Achievement(Base):
+    __tablename__ = 'achievements'
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'))
+    name = Column(String)
+    icon = Column(String)
+    description = Column(String)
+    tier = Column(Integer, default=1)
+    max_tier = Column(Integer, default=5)
+    unlocked_at = Column(DateTime, default=lambda: datetime.datetime.now(WIB))
+    last_updated_at = Column(DateTime, default=lambda: datetime.datetime.now(WIB))
 
 class TimeLog(Base):
     __tablename__ = 'timelogs'
