@@ -17,7 +17,7 @@ class LifeOSCore:
             base_url="https://openrouter.ai/api/v1",
             api_key=os.getenv("OPENROUTER_API_KEY"),
         )
-        self.model_name = "meta-llama/llama-3.3-70b:free"
+        self.model_name = "meta-llama/llama-3.3-70b-instruct:free"
 
     def get_or_create_user(self, phone_number: str, name: str):
         # Try to find user
