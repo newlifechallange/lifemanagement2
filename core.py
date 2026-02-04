@@ -13,7 +13,7 @@ WIB = pytz.timezone('Asia/Jakarta')
 class LifeOSCore:
     def __init__(self):
         genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-        self.model = genai.GenerativeModel('gemini-flash-lite-latest')
+        self.model = genai.GenerativeModel('gemini-flash-latest')
 
     def get_or_create_user(self, phone_number: str, name: str):
         # Try to find user
