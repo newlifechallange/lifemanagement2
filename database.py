@@ -43,6 +43,7 @@ class ChatHistory(Base):
     user_id = Column(Integer, ForeignKey('users.id'))
     role = Column(String)
     content = Column(String)
+    message_id = Column(String, unique=True, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.datetime.now(WIB))
 
 class Achievement(Base):
