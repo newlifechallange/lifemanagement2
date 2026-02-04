@@ -90,10 +90,38 @@ class LifeOSCore:
 
         return log_context, attr_context, plan_context, history_context, chat_context
 
-    def process_message(self, user_input, phone_number, user_name):
+    def process_message(self, user_input, phone_number, user_name, message_id=None):
         try:
             user = self.get_or_create_user(phone_number, user_name)
             user_id = user['id']
+
+            # --- DEDUPLICATION CHECK ---
+            if message_id:
+                # Check if this message was already processed/is processing
+                existing = supabase.table('chat_history').select('id').eq('message_id', message_id).execute()
+                if existing.data:
+                    print(f"Duplicate message {message_id} detected. Ignoring.")
+                    return {"response_text": "", "action": "NONE", "status": "duplicate"}
+
+                # Lock it: Insert User Message IMMEDIATELY
+                # If another concurrent request tries this, one will fail (if we had strict DB constraints working perfectly with the client)
+                # But the select check above catches 99% of retry cases which are usually sequential (timeout -> retry)
+                supabase.table('chat_history').insert({
+                    "user_id": user_id,
+                    "role": "user",
+                    "content": user_input,
+                    "message_id": message_id,
+                    "created_at": datetime.datetime.now(WIB).isoformat()
+                }).execute()
+            else:
+                 # Fallback for manual testing without IDs
+                 supabase.table('chat_history').insert({
+                    "user_id": user_id,
+                    "role": "user",
+                    "content": user_input,
+                    "created_at": datetime.datetime.now(WIB).isoformat()
+                }).execute()
+
 
             log_context, attr_context, plan_context, history_context, chat_context = self.get_context(user_id)
             now_wib = datetime.datetime.now(WIB)
@@ -239,14 +267,8 @@ class LifeOSCore:
                     self.execute_unlock_achievement(user_id, data)
 
             # --- Update Chat History (Persist to DB) ---
-            # 1. User Message
-            supabase.table('chat_history').insert({
-                "user_id": user_id,
-                "role": "user",
-                "content": user_input,
-                "created_at": datetime.datetime.now(WIB).isoformat()
-            }).execute()
-
+            # 1. User Message (ALREADY INSERTED AT START)
+            
             # 2. Assistant Response
             supabase.table('chat_history').insert({
                 "user_id": user_id,
