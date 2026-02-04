@@ -2,7 +2,7 @@ import os
 import json
 import datetime
 import pytz
-import google.generativeai as genai
+from openai import OpenAI
 from db_client import supabase
 from dotenv import load_dotenv
 
@@ -12,8 +12,12 @@ WIB = pytz.timezone('Asia/Jakarta')
 
 class LifeOSCore:
     def __init__(self):
-        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-        self.model = genai.GenerativeModel('gemini-flash-latest')
+        # OpenRouter Configuration
+        self.client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=os.getenv("OPENROUTER_API_KEY"),
+        )
+        self.model_name = "meta-llama/llama-3.3-70b:free"
 
     def get_or_create_user(self, phone_number: str, name: str):
         # Try to find user
@@ -238,10 +242,23 @@ class LifeOSCore:
             Only include relevant keys in "data". Use current date {datetime.datetime.now(WIB).strftime("%Y-%m-%d")} for timestamps.
             """
 
-            response = self.model.generate_content([system_instruction, user_input])
-            res_text = response.text.strip()
+            completion = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": user_input}
+                ],
+                temperature=0.7,
+            )
+            
+            res_text = completion.choices[0].message.content.strip()
+            
+            # Cleaning Llama's output (it often adds ```json ... ```)
             if res_text.startswith("```json"):
-                res_text = res_text[7:-3].strip()
+                res_text = res_text[7:]
+            if res_text.endswith("```"):
+                res_text = res_text[:-3]
+            res_text = res_text.strip()
             
             result = json.loads(res_text)
             
