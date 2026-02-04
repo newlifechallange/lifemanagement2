@@ -83,303 +83,162 @@ class LifeOSCore:
                 "notes": h.get('notes')
             })
 
-                    # Fetch Chat History (Last 10 messages / 5 turns)
-                chat_res = supabase.table('chat_history').select("*").eq('user_id', user_id).order('created_at', desc=True).limit(10).execute()
-                # Messages come in reverse order (newest first), reverse them back for context
-                chat_context = [{"role": c['role'], "content": c['content']} for c in reversed(chat_res.data)]
-        
-                return log_context, attr_context, plan_context, history_context, chat_context
-        
-            def process_message(self, user_input, phone_number, user_name):
-                try:
-                    user = self.get_or_create_user(phone_number, user_name)
-                    user_id = user['id']
-        
-                    log_context, attr_context, plan_context, history_context, chat_context = self.get_context(user_id)
-                    now_wib = datetime.datetime.now(WIB)
-                    today_str = now_wib.strftime("%Y-%m-%d")
-                    
-                                
-                    
-                                # --- Daily Streak & Summary Logic ---
-                    
-                                daily_briefing_prompt = ""
-                    
-                                last_active = user.get('last_active_date')
-                    
-                                
-                    
-                                # Check if first message of the day
-                    
-                                if last_active != today_str:
-                    
-                                    # Calculate Streak
-                    
-                                    current_streak = user.get('current_streak', 0)
-                    
-                                    yesterday_str = (now_wib - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-                    
-                                    
-                    
-                                    if last_active == yesterday_str:
-                    
-                                        new_streak = current_streak + 1
-                    
-                                    else:
-                    
-                                        new_streak = 1 # Reset if missed a day or first time
-                    
-                                    
-                    
-                                    # Update DB
-                    
-                                    supabase.table('users').update({
-                    
-                                        "last_active_date": today_str,
-                    
-                                        "current_streak": new_streak
-                    
-                                    }).eq('id', user_id).execute()
-                    
-                    
-                    
-                                    # Fetch Yesterday's Data for Summary
-                    
-                                    yest_start = (now_wib - datetime.timedelta(days=1)).replace(hour=0, minute=0, second=0).isoformat()
-                    
-                                    yest_end = now_wib.replace(hour=0, minute=0, second=0).isoformat()
-                    
-                                    
-                    
-                                    yest_logs = supabase.table('timelogs').select("*").eq('user_id', user_id).gte('start_time', yest_start).lt('start_time', yest_end).execute().data
-                    
-                                    yest_attrs = supabase.table('attribute_history').select("*").eq('user_id', user_id).gte('recorded_at', yest_start).lt('recorded_at', yest_end).execute().data
-                    
-                                    
-                    
-                                    # Fetch Existing Achievements
-                    
-                                    achievements_res = supabase.table('achievements').select("*").eq('user_id', user_id).execute()
-                    
-                                    existing_achievements = [{
-                    
-                                        "name": a['name'],
-                    
-                                        "tier": a['tier'],
-                    
-                                        "max_tier": a['max_tier'],
-                    
-                                        "description": a['description']
-                    
-                                    } for a in achievements_res.data]
-                    
-                    
-                    
-                                    daily_briefing_prompt = f"""
-                    
-                                    [SPECIAL SYSTEM EVENT: FIRST MESSAGE OF THE DAY]
-                    
-                                    - Current Streak: {new_streak} days!
-                    
-                                    - Yesterday's Activities: {json.dumps([l['activity'] for l in yest_logs])}
-                    
-                                    - Yesterday's Attribute Changes: {json.dumps([a['key'] for a in yest_attrs])}
-                    
-                                    - Existing Achievements: {json.dumps(existing_achievements)}
-                    
-                                    
-                    
-                                    INSTRUCTION: Start your response with a "Start of Day Briefing". 
-                    
-                                    1. Congratulate user on the {new_streak}-day streak.
-                    
-                                    2. Summarize yesterday's activities.
-                    
-                                    3. ACHIEVEMENT CHECK: Analyze yesterday's data. Did the user do something impressive?
-                    
-                                       - If yes, check "Existing Achievements".
-                    
-                                       - If a similar achievement exists and tier < 5, generate UNLOCK_ACHIEVEMENT with same name to UPGRADE it.
-                    
-                                       - If it exists but is maxed (Tier 5), generate a NEW, more epic achievement name.
-                    
-                                       - If it's new, generate UNLOCK_ACHIEVEMENT.
-                    
-                                       - Be creative with names/icons!
-                    
-                                    4. Then, answer the user's actual input below.
-                    
-                                    """
-                    
-                    
-                    
-                                system_instruction = f"""
-                    
-                                You are LifeOS, a personal assistant. Timezone: Asia/Jakarta (WIB).
-                    
-                                Current Date/Time: {now_wib.strftime("%Y-%m-%d %H:%M:%S")}
-                    
-                                User: {user_name}
-                    
-                    
-                    
-                                Context:
-                    
-                                - Today's Activity Logs (Since Midnight): {json.dumps(log_context)}
-                    
-                                - Current Attributes: {json.dumps(attr_context)}
-                    
-                                - Attribute History (Past changes): {json.dumps(history_context)}
-                    
-                                - Upcoming Plans: {json.dumps(plan_context)}
-                    
-                                - Chat History (last 5 turns): {json.dumps(chat_context)}
-                    
-                    
-                    
-                                {daily_briefing_prompt}
-                    
-                    
-                    
-                                Rules:
-                    
-                                1. Activities: If user mentions past activity, ASK to confirm time, then LOG_TIME.
-                    
-                                2. Plans: If user mentions FUTURE activity (e.g., "I will gym at 5pm"), ASK to confirm, then PLAN_ACTIVITY.
-                    
-                                3. Completion: If user says they DID a planned activity, use LOG_TIME and explicitly mention the plan_id in data to mark it complete.
-                    
-                                4. State: If user mentions state (weight), verify then UPDATE_STATE.
-                    
-                                5. Gaps: Check for >30min gaps between last activity and new activity start.
-                    
-                                6. Corrections: Handle typos using history.
-                    
-                                7. Categorization: Classify into: Work, Chore, Romantic, Rest, Entertainment, Exercise. If none fit, CREATE a new appropriate category (do not use 'Others').
-                    
-                                8. Queries: The user may ask for summaries (e.g., "How long did I work?"). Calculate this YOURSELF from "Today's Activity Logs" context. Sum the 'minutes' for matching categories/activities. If no logs exist, say so.
-                    
-                                9. Deletion: If user asks to delete/remove something, use DELETE action. For attributes, provide "key". For logs or plans, provide "id" (found in Context).
-                    
-                                10. Tags: If user specifies a tag (e.g. "project:1"), extract it.
-                    
-                                11. Intervals: If user describes interleaved time (e.g., "3 hours work, 5 min break every 30m"), DO NOT log every single interval. Calculate TOTAL WORK duration and TOTAL REST duration. Log them as two separate, consecutive entries. Add a note "Aggregated from intervals".
-                    
-                    
-                    
-                                Output Format (JSON ONLY):
-                    
-                                {{
-                    
-                                  "response_text": "Friendly message answering the user or confirming action",
-                    
-                                  "actions": [
-                    
-                                    {{
-                    
-                                      "type": "LOG_TIME" | "UPDATE_STATE" | "PLAN_ACTIVITY" | "DELETE" | "QUERY" | "UNLOCK_ACHIEVEMENT",
-                    
-                                      "data": {{
-                    
-                                        "activity": "string", 
-                    
-                                        "start_time": "ISO_TIMESTAMP", 
-                    
-                                        "end_time": "ISO_TIMESTAMP", 
-                    
-                                        "category": "Work" | "Chore" | "Romantic" | "Rest" | "Entertainment" | "Exercise" | "CustomString",
-                    
-                                        "tag": "string",
-                    
-                                        "key": "attribute_key",
-                    
-                                        "value": "string_or_num",
-                    
-                                        "unit": "string",
-                    
-                                        "notes": "string",
-                    
-                                        "type": "timelog|attribute|plan",
-                    
-                                        "id": "integer_id",
-                    
-                                        "name": "Achievement Name",
-                    
-                                        "icon": "Emoji",
-                    
-                                        "description": "Reason for award"
-                    
-                                      }}
-                    
-                                    }}
-                    
-                                  ]
-                    
-                                }}
-                    
-                                Only include relevant keys in "data". Use current date {datetime.datetime.now(WIB).strftime("%Y-%m-%d")} for timestamps.
-                    
-                                """
-                    
-                    
-                    
-                                response = self.model.generate_content([system_instruction, user_input])
-                    
-                                res_text = response.text.strip()
-                    
-                                if res_text.startswith("```json"):
-                    
-                                    res_text = res_text[7:-3].strip()
-                    
-                                
-                    
-                                result = json.loads(res_text)
-                    
-                                
-                    
-                                # Execute Actions
-                    
-                                actions = result.get("actions", [])
-                    
-                                # Support legacy single-action format if model slips (optional but safe)
-                    
-                                if "action" in result and "data" in result and not actions:
-                    
-                                    actions = [{"type": result["action"], "data": result["data"]}]
-                    
-                    
-                    
-                                for act in actions:
-                    
-                                    action_type = act.get("type")
-                    
-                                    data = act.get("data", {})
-                    
-                                    
-                    
-                                    if action_type == "LOG_TIME" and data:
-                    
-                                        self.execute_log_time(user_id, data)
-                    
-                                    elif action_type == "UPDATE_STATE" and data:
-                    
-                                        self.execute_update_state(user_id, data)
-                    
-                                    elif action_type == "PLAN_ACTIVITY" and data:
-                    
-                                        self.execute_plan_activity(user_id, data)
-                    
-                                    elif action_type == "DELETE" and data:
-                    
-                                        self.execute_delete(user_id, data)
-                    
-                                    elif action_type == "UNLOCK_ACHIEVEMENT" and data:
-                    
-                                        self.execute_unlock_achievement(user_id, data)
-                    
-                    
-                    
-                                # --- Update Chat History (Persist to DB) ---
+        # Fetch Chat History (Last 10 messages / 5 turns)
+        chat_res = supabase.table('chat_history').select("*").eq('user_id', user_id).order('created_at', desc=True).limit(10).execute()
+        # Messages come in reverse order (newest first), reverse them back for context
+        chat_context = [{"role": c['role'], "content": c['content']} for c in reversed(chat_res.data)]
+
+        return log_context, attr_context, plan_context, history_context, chat_context
+
+    def process_message(self, user_input, phone_number, user_name):
+        try:
+            user = self.get_or_create_user(phone_number, user_name)
+            user_id = user['id']
+
+            log_context, attr_context, plan_context, history_context, chat_context = self.get_context(user_id)
+            now_wib = datetime.datetime.now(WIB)
+            today_str = now_wib.strftime("%Y-%m-%d")
+            
+            # --- Daily Streak & Summary Logic ---
+            daily_briefing_prompt = ""
+            last_active = user.get('last_active_date')
+            
+            # Check if first message of the day
+            if last_active != today_str:
+                # Calculate Streak
+                current_streak = user.get('current_streak', 0)
+                yesterday_str = (now_wib - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+                
+                if last_active == yesterday_str:
+                    new_streak = current_streak + 1
+                else:
+                    new_streak = 1 # Reset if missed a day or first time
+                
+                # Update DB
+                supabase.table('users').update({
+                    "last_active_date": today_str,
+                    "current_streak": new_streak
+                }).eq('id', user_id).execute()
+
+                # Fetch Yesterday's Data for Summary
+                yest_start = (now_wib - datetime.timedelta(days=1)).replace(hour=0, minute=0, second=0).isoformat()
+                yest_end = now_wib.replace(hour=0, minute=0, second=0).isoformat()
+                
+                yest_logs = supabase.table('timelogs').select("*").eq('user_id', user_id).gte('start_time', yest_start).lt('start_time', yest_end).execute().data
+                yest_attrs = supabase.table('attribute_history').select("*").eq('user_id', user_id).gte('recorded_at', yest_start).lt('recorded_at', yest_end).execute().data
+                
+                # Fetch Existing Achievements
+                achievements_res = supabase.table('achievements').select("*").eq('user_id', user_id).execute()
+                existing_achievements = [{
+                    "name": a['name'],
+                    "tier": a['tier'],
+                    "max_tier": a['max_tier'],
+                    "description": a['description']
+                } for a in achievements_res.data]
+
+                daily_briefing_prompt = f"""
+                [SPECIAL SYSTEM EVENT: FIRST MESSAGE OF THE DAY]
+                - Current Streak: {new_streak} days!
+                - Yesterday's Activities: {json.dumps([l['activity'] for l in yest_logs])}
+                - Yesterday's Attribute Changes: {json.dumps([a['key'] for a in yest_attrs])}
+                - Existing Achievements: {json.dumps(existing_achievements)}
+                
+                INSTRUCTION: Start your response with a "Start of Day Briefing". 
+                1. Congratulate user on the {new_streak}-day streak.
+                2. Summarize yesterday's activities.
+                3. ACHIEVEMENT CHECK: Analyze yesterday's data. Did the user do something impressive?
+                   - If yes, check "Existing Achievements".
+                   - If a similar achievement exists and tier < 5, generate UNLOCK_ACHIEVEMENT with same name to UPGRADE it.
+                   - If it exists but is maxed (Tier 5), generate a NEW, more epic achievement name.
+                   - If it's new, generate UNLOCK_ACHIEVEMENT.
+                   - Be creative with names/icons!
+                4. Then, answer the user's actual input below.
+                """
+
+            system_instruction = f"""
+            You are LifeOS, a personal assistant. Timezone: Asia/Jakarta (WIB).
+            Current Date/Time: {now_wib.strftime("%Y-%m-%d %H:%M:%S")}
+            User: {user_name}
+
+            Context:
+            - Today's Activity Logs (Since Midnight): {json.dumps(log_context)}
+            - Current Attributes: {json.dumps(attr_context)}
+            - Attribute History (Past changes): {json.dumps(history_context)}
+            - Upcoming Plans: {json.dumps(plan_context)}
+            - Chat History (last 5 turns): {json.dumps(chat_context)}
+
+            {daily_briefing_prompt}
+
+            Rules:
+            1. Activities: If user mentions past activity, ASK to confirm time, then LOG_TIME.
+            2. Plans: If user mentions FUTURE activity (e.g., "I will gym at 5pm"), ASK to confirm, then PLAN_ACTIVITY.
+            3. Completion: If user says they DID a planned activity, use LOG_TIME and explicitly mention the plan_id in data to mark it complete.
+            4. State: If user mentions state (weight), verify then UPDATE_STATE.
+            5. Gaps: Check for >30min gaps between last activity and new activity start.
+            6. Corrections: Handle typos using history.
+            7. Categorization: Classify into: Work, Chore, Romantic, Rest, Entertainment, Exercise. If none fit, CREATE a new appropriate category (do not use 'Others').
+            8. Queries: The user may ask for summaries (e.g., "How long did I work?"). Calculate this YOURSELF from "Today's Activity Logs" context. Sum the 'minutes' for matching categories/activities. If no logs exist, say so.
+            9. Deletion: If user asks to delete/remove something, use DELETE action. For attributes, provide "key". For logs or plans, provide "id" (found in Context).
+            10. Tags: If user specifies a tag (e.g. "project:1"), extract it.
+            11. Intervals: If user describes interleaved time (e.g., "3 hours work, 5 min break every 30m"), DO NOT log every single interval. Calculate TOTAL WORK duration and TOTAL REST duration. Log them as two separate, consecutive entries. Add a note "Aggregated from intervals".
+
+            Output Format (JSON ONLY):
+            {{
+              "response_text": "Friendly message answering the user or confirming action",
+              "actions": [
+                {{
+                  "type": "LOG_TIME" | "UPDATE_STATE" | "PLAN_ACTIVITY" | "DELETE" | "QUERY" | "UNLOCK_ACHIEVEMENT",
+                  "data": {{
+                    "activity": "string", 
+                    "start_time": "ISO_TIMESTAMP", 
+                    "end_time": "ISO_TIMESTAMP", 
+                    "category": "Work" | "Chore" | "Romantic" | "Rest" | "Entertainment" | "Exercise" | "CustomString",
+                    "tag": "string",
+                    "key": "attribute_key",
+                    "value": "string_or_num",
+                    "unit": "string",
+                    "notes": "string",
+                    "type": "timelog|attribute|plan",
+                    "id": "integer_id",
+                    "name": "Achievement Name",
+                    "icon": "Emoji",
+                    "description": "Reason for award"
+                  }}
+                }}
+              ]
+            }}
+            Only include relevant keys in "data". Use current date {datetime.datetime.now(WIB).strftime("%Y-%m-%d")} for timestamps.
+            """
+
+            response = self.model.generate_content([system_instruction, user_input])
+            res_text = response.text.strip()
+            if res_text.startswith("```json"):
+                res_text = res_text[7:-3].strip()
+            
+            result = json.loads(res_text)
+            
+            # Execute Actions
+            actions = result.get("actions", [])
+            # Support legacy single-action format if model slips (optional but safe)
+            if "action" in result and "data" in result and not actions:
+                actions = [{"type": result["action"], "data": result["data"]}]
+
+            for act in actions:
+                action_type = act.get("type")
+                data = act.get("data", {})
+                
+                if action_type == "LOG_TIME" and data:
+                    self.execute_log_time(user_id, data)
+                elif action_type == "UPDATE_STATE" and data:
+                    self.execute_update_state(user_id, data)
+                elif action_type == "PLAN_ACTIVITY" and data:
+                    self.execute_plan_activity(user_id, data)
+                elif action_type == "DELETE" and data:
+                    self.execute_delete(user_id, data)
+                elif action_type == "UNLOCK_ACHIEVEMENT" and data:
+                    self.execute_unlock_achievement(user_id, data)
+
+            # --- Update Chat History (Persist to DB) ---
             # 1. User Message
             supabase.table('chat_history').insert({
                 "user_id": user_id,
