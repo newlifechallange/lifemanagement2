@@ -162,10 +162,12 @@ class LifeOSCore:
             if res_text.startswith("```json"): res_text = res_text[7:]
             if res_text.endswith("```"): res_text = res_text[:-3]
             result = json.loads(res_text.strip())
+            print(f"DEBUG: AI Result: {json.dumps(result, indent=2)}")
 
             for act in result.get("actions", []):
                 act_type = act.get("type")
                 data = act.get("data", {})
+                print(f"DEBUG: Executing action: {act_type} with data: {data}")
                 
                 if act_type == "LOG_TIME":
                     self.execute_log_time(user_id, data)
@@ -189,18 +191,31 @@ class LifeOSCore:
 
     def execute_log_time(self, user_id, data):
         try:
-            start = datetime.datetime.fromisoformat(data['start_time'])
+            print(f"DEBUG: execute_log_time called with data: {data}")
+            start_str = data.get('start_time')
+            end_str = data.get('end_time')
+            if not start_str or not end_str:
+                print(f"DEBUG: Missing start_time or end_time. start: {start_str}, end: {end_str}")
+                return
+
+            start = datetime.datetime.fromisoformat(start_str)
             if start.tzinfo is None: start = WIB.localize(start)
-            end = datetime.datetime.fromisoformat(data['end_time'])
+            end = datetime.datetime.fromisoformat(end_str)
             if end.tzinfo is None: end = WIB.localize(end)
             duration = int((end - start).total_seconds() / 60)
             
-            supabase.table('timelogs').insert({
-                "user_id": user_id, "activity": data['activity'], "start_time": start.isoformat(),
+            insert_data = {
+                "user_id": user_id, "activity": data.get('activity'), "start_time": start.isoformat(),
                 "end_time": end.isoformat(), "duration_minutes": duration, 
                 "category": data.get('category'), "tag": data.get('tag'), "notes": data.get('notes')
-            }).execute()
-        except Exception as e: print(f"Log Time Error: {e}")
+            }
+            print(f"DEBUG: Inserting into timelogs: {insert_data}")
+            res = supabase.table('timelogs').insert(insert_data).execute()
+            print(f"DEBUG: Insert result: {res.data}")
+        except Exception as e: 
+            print(f"Log Time Error: {e}")
+            import traceback
+            traceback.print_exc()
 
     def execute_update_state(self, user_id, data):
         try:
