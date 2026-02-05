@@ -85,7 +85,7 @@ class POSCore:
         USER ROLE: {role}
         
         INTENTS:
-        - SALES: Selling, Checkout, Add to Cart, Debt/Kasbon, "John owes for [item]", "Catat hutang [item]".
+        - SALES: Selling, Checkout, Add to Cart, Debt/Kasbon, "John owes for [item]", "John paid debt".
         - INVENTORY: Stock updates, Buying ingredients, "Beli beras untuk stok", "Set harga".
         - FINANCE: Expenses (Non-stock), Personal withdrawals, Shifts, "Bayar listrik", "Ambil uang".
         - REPORTING: "Laporan", "Omzet", "Profit", "Summary".
@@ -143,13 +143,13 @@ class POSCore:
            - **IMPORTANT**: If user says "Sell [Item] and checkout", you MUST provide TWO actions: 1. ADD_TO_CART, then 2. CHECKOUT.
            - **DEBT (Piutang)**: If user says "John owes for [Item]", you MUST use "John" as `customer_name`. Do NOT use "customer1" if a name is provided.
            - Methods: Cash, Bank, QRIS, Piutang (Debt).
-        3. **Repayment**: "John paid 50k debt" -> REPAY_DEBT. (Use the EXACT name from the user).
+        3. **Repayment**: "John paid 50k debt" -> you MUST use `REPAY_DEBT` action. (Use EXACT name, e.g. John).
 
-        JSON OUTPUT: {{ "response_text": "...", "actions": [ {{ "type": "ADD_TO_CART", "data": {{...}} }}, {{ "type": "CHECKOUT", "data": {{...}} }} ] }}
+        JSON OUTPUT: {{ "response_text": "...", "actions": [ {{ "type": "REPAY_DEBT", "data": {{ "customer_name": "John", "amount": 50000 }} }} ] }}
         
         MANDATORY: 
         - Output ONLY valid JSON.
-        - **NO TRANSLATION**: Keep Product/Customer names EXACTLY as in Context/Input.
+        - **NO TRANSLATION**: Keep names EXACTLY as in Context/Input.
         """
         return self.run_llm(prompt, user_input, user_id, store_id, role, tz)
 
