@@ -72,18 +72,27 @@ class LifeOSCore:
             user = self.get_or_create_user(phone_number, user_name)
             user_id = user['id']
 
+            # --- DEDUPLICATION CHECK ---
             if message_id:
+                # Check if this message was already processed
                 existing = supabase.table('chat_history').select('id').eq('message_id', message_id).execute()
                 if existing.data:
                     return {"response_text": "", "action": "NONE", "status": "duplicate"}
-                
+
+                # Log User Message IMMEDIATELY to "lock" it
                 supabase.table('chat_history').insert({
-                    "user_id": user_id, "role": "user", "content": user_input,
-                    "message_id": message_id, "created_at": datetime.datetime.now(WIB).isoformat()
+                    "user_id": user_id, 
+                    "role": "user", 
+                    "content": user_input,
+                    "message_id": message_id, 
+                    "created_at": datetime.datetime.now(WIB).isoformat()
                 }).execute()
             else:
+                 # Fallback for testing without IDs
                  supabase.table('chat_history').insert({
-                    "user_id": user_id, "role": "user", "content": user_input,
+                    "user_id": user_id, 
+                    "role": "user", 
+                    "content": user_input,
                     "created_at": datetime.datetime.now(WIB).isoformat()
                 }).execute()
 
@@ -192,26 +201,71 @@ class LifeOSCore:
     def execute_log_time(self, user_id, data):
         try:
             print(f"DEBUG: execute_log_time called with data: {data}")
-            start_str = data.get('start_time')
+            
+            # 1. Flexible Key Mapping
+            start_str = data.get('start_time') or data.get('start')
             end_str = data.get('end_time')
-            if not start_str or not end_str:
-                print(f"DEBUG: Missing start_time or end_time. start: {start_str}, end: {end_str}")
+            minutes = data.get('minutes')
+            activity = data.get('activity')
+
+            if not start_str:
+                print("DEBUG: No start time provided.")
                 return
 
-            start = datetime.datetime.fromisoformat(start_str)
-            if start.tzinfo is None: start = WIB.localize(start)
-            end = datetime.datetime.fromisoformat(end_str)
-            if end.tzinfo is None: end = WIB.localize(end)
-            duration = int((end - start).total_seconds() / 60)
+            now = datetime.datetime.now(WIB)
+            
+            # 2. Parse Start Time
+            # Handle "HH:MM" vs "ISO"
+            if "T" in start_str:
+                start_dt = datetime.datetime.fromisoformat(start_str)
+            else:
+                # Assume HH:MM for today
+                h, m = map(int, start_str.split(':'))
+                start_dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
+                
+                # If start time is in the future relative to "now" (e.g. logging 23:00 at 01:00)
+                # it likely means yesterday.
+                if start_dt > now + datetime.timedelta(minutes=30): 
+                    start_dt -= datetime.timedelta(days=1)
+
+            if start_dt.tzinfo is None:
+                start_dt = WIB.localize(start_dt)
+
+            # 3. Handle End Time / Duration
+            if end_str:
+                if "T" in end_str:
+                    end_dt = datetime.datetime.fromisoformat(end_str)
+                else:
+                    h, m = map(int, end_str.split(':'))
+                    end_dt = start_dt.replace(hour=h, minute=m)
+                    if end_dt < start_dt:
+                        end_dt += datetime.timedelta(days=1)
+            elif minutes:
+                end_dt = start_dt + datetime.timedelta(minutes=int(minutes))
+            else:
+                print("DEBUG: No end_time or minutes provided.")
+                return
+
+            if end_dt.tzinfo is None:
+                end_dt = WIB.localize(end_dt)
+
+            duration = int((end_dt - start_dt).total_seconds() / 60)
             
             insert_data = {
-                "user_id": user_id, "activity": data.get('activity'), "start_time": start.isoformat(),
-                "end_time": end.isoformat(), "duration_minutes": duration, 
-                "category": data.get('category'), "tag": data.get('tag'), "notes": data.get('notes')
+                "user_id": user_id, 
+                "activity": activity, 
+                "start_time": start_dt.isoformat(),
+                "end_time": end_dt.isoformat(), 
+                "duration_minutes": duration, 
+                "category": data.get('category'), 
+                "tag": data.get('tag'), 
+                "notes": data.get('notes')
             }
+            
             print(f"DEBUG: Inserting into timelogs: {insert_data}")
             res = supabase.table('timelogs').insert(insert_data).execute()
-            print(f"DEBUG: Insert result: {res.data}")
+            print(f"DEBUG: Insert success: {res.data[0]['id'] if res.data else 'Failed'}")
+            
         except Exception as e: 
             print(f"Log Time Error: {e}")
             import traceback
