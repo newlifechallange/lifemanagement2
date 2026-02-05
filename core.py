@@ -16,7 +16,7 @@ class LifeOSCore:
             base_url="https://openrouter.ai/api/v1",
             api_key=os.getenv("OPENROUTER_API_KEY"),
         )
-        self.model_name = "upstage/solar-pro-3:free"
+        self.model_name = "arcee-ai/trinity-large-preview:free"
 
     def get_or_create_user(self, phone_number: str, name: str):
         response = supabase.table('users').select("*").eq('phone_number', phone_number).execute()
