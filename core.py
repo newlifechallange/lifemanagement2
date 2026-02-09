@@ -70,6 +70,20 @@ class LifeOSCore:
             user = self.get_or_create_user(phone_number, user_name)
             user_id = user['id']
 
+            # --- EMERGENCY COOLDOWN CHECK ---
+            # Check the last message sent BY THE ASSISTANT to this user
+            last_msg = supabase.table('chat_history').select('created_at').eq('user_id', user_id).eq('role', 'assistant').order('created_at', desc=True).limit(1).execute()
+            
+            if last_msg.data:
+                last_time = datetime.datetime.fromisoformat(last_msg.data[0]['created_at'].replace('Z', '+00:00')).astimezone(WIB)
+                now_time = datetime.datetime.now(WIB)
+                time_diff = (now_time - last_time).total_seconds()
+                
+                # If we replied less than 10 seconds ago, IGNORE this request.
+                if time_diff < 10:
+                    print(f"COOLDOWN ACTIVE: Last reply was {time_diff:.1f}s ago. Ignoring.")
+                    return {"response_text": "", "action": "NONE", "status": "cooldown"}
+
             # --- ATOMIC DEDUPLICATION ---
             if message_id:
                 # Try to insert user message first. If message_id is unique, 
@@ -260,6 +274,84 @@ class LifeOSCore:
                     return
             if table and 'id' in data: supabase.table(table).delete().eq('id', data['id']).eq('user_id', user_id).execute()
         except Exception as e: print(f"Delete Error: {e}")
+
+    def check_gaps_and_notify(self, user_id):
+        try:
+            now_wib = datetime.datetime.now(WIB)
+            today_str = now_wib.strftime("%Y-%m-%d")
+            
+            # Define Active Window: 6 AM to 9 PM (or current time if earlier)
+            start_hour = 6
+            end_hour = 21
+            
+            # If it's before 7 AM, don't bother checking yet
+            if now_wib.hour < 7: return None
+            
+            # Upper bound is either 9 PM or NOW (if it's earlier than 9 PM)
+            check_end_time = now_wib if now_wib.hour < end_hour else now_wib.replace(hour=end_hour, minute=0, second=0)
+            check_start_time = now_wib.replace(hour=start_hour, minute=0, second=0, microsecond=0)
+            
+            # Fetch logs for today
+            logs = supabase.table('timelogs').select("*").eq('user_id', user_id).gte('start_time', check_start_time.isoformat()).lt('start_time', check_end_time.isoformat()).order('start_time', desc=False).execute().data
+            
+            # Find Gaps
+            gaps = []
+            current_pointer = check_start_time
+            
+            # We need to sort logs by start_time to be sure
+            # (already sorted by DB, but good to be safe if we merge lists)
+            
+            for log in logs:
+                log_start = datetime.datetime.fromisoformat(log['start_time'].replace('Z', '+00:00')).astimezone(WIB)
+                log_end = datetime.datetime.fromisoformat(log['end_time'].replace('Z', '+00:00')).astimezone(WIB)
+                
+                # Gap between pointer and this log start?
+                gap_minutes = (log_start - current_pointer).total_seconds() / 60
+                
+                if gap_minutes > 60:
+                    gaps.append({
+                        "start": current_pointer,
+                        "end": log_start,
+                        "minutes": int(gap_minutes)
+                    })
+                
+                # Move pointer to end of this log
+                if log_end > current_pointer:
+                    current_pointer = log_end
+            
+            # Final gap check (from last log to NOW)
+            final_gap_minutes = (check_end_time - current_pointer).total_seconds() / 60
+            if final_gap_minutes > 60:
+                gaps.append({
+                    "start": current_pointer,
+                    "end": check_end_time,
+                    "minutes": int(final_gap_minutes)
+                })
+            
+            if not gaps: return None
+            
+            # Logic: 1 Gap -> Warn. 2+ Gaps -> Auto-fill oldest.
+            if len(gaps) == 1:
+                g = gaps[0]
+                return f"⚠️ **Gap Detected:** You have a {g['minutes']} min gap between {g['start'].strftime('%H:%M')} and {g['end'].strftime('%H:%M')}. What were you doing?"
+            
+            elif len(gaps) >= 2:
+                # Auto-fill the OLDEST gap
+                g_to_fill = gaps[0]
+                
+                self.execute_log_time(user_id, {
+                    "activity": "Unproductive (Auto-filled)",
+                    "category": "Others",
+                    "start_time": g_to_fill['start'].isoformat(),
+                    "end_time": g_to_fill['end'].isoformat(),
+                    "notes": "Auto-filled by Chroniter due to multiple gaps."
+                })
+                
+                return f"⚠️ **Multiple Gaps Detected!**\nI auto-logged {g_to_fill['start'].strftime('%H:%M')}-{g_to_fill['end'].strftime('%H:%M')} as 'Unproductive'.\n\nPlease fill the remaining gap ({gaps[1]['minutes']} min) manually!"
+
+        except Exception as e:
+            print(f"Gap Check Error: {e}")
+            return None
 
     def execute_unlock_achievement(self, user_id, data):
         try:
