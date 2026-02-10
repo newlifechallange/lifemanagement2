@@ -12,27 +12,15 @@ core = LifeOSCore()
 
 @app.route('/check-gaps', methods=['GET', 'POST'])
 def check_gaps():
-    # In a real app, verify a secret token header here to prevent abuse
-    # e.g. if request.headers.get('CRON_SECRET') != os.getenv('CRON_SECRET'): return 'Unauthorized', 401
-    
     try:
-        # Fetch all users
-        # For MVP, just get all users. In production, paginate.
         users = supabase.table('users').select("id, phone_number, name").execute().data
-        
         results = []
         for user in users:
             uid = user['id']
-            phone = user['phone_number']
-            
-            # Check gaps
             notification = core.check_gaps_and_notify(uid)
-            
             if notification:
-                # Send WhatsApp message
-                send_whatsapp(phone, notification)
-                results.append(f"Notified {user['name']}: {notification}")
-        
+                send_whatsapp(user['phone_number'], notification)
+                results.append(f"Notified {user['name']}")
         return jsonify({"status": "ok", "results": results}), 200
     except Exception as e:
         print(f"Cron Error: {e}")
