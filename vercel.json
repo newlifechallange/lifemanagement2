@@ -11,11 +11,5 @@
             "src": "/(.*)",
             "dest": "app.py"
         }
-    ],
-    "crons": [
-        {
-            "path": "/check-gaps",
-            "schedule": "0 * * * *"
-        }
     ]
 }
