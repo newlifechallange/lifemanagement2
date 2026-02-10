@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, JSON
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, JSON, Float
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 import datetime
@@ -10,11 +10,11 @@ WIB = pytz.timezone('Asia/Jakarta')
 class User(Base):
     __tablename__ = 'users'
     id = Column(Integer, primary_key=True)
-    phone_number = Column(String, unique=True, nullable=True) # Optional for MVP
+    phone_number = Column(String, unique=True, nullable=True)
     name = Column(String)
     timezone = Column(String, default='Asia/Jakarta')
     current_streak = Column(Integer, default=0)
-    last_active_date = Column(DateTime, nullable=True) # Using DateTime for SQLAlchemy mapping to DATE
+    last_active_date = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.datetime.now(WIB))
 
 class Attribute(Base):
@@ -22,7 +22,7 @@ class Attribute(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey('users.id'))
     key = Column(String)
-    value = Column(String) # Store as string, parse as needed
+    value = Column(String)
     unit = Column(String, nullable=True)
     notes = Column(String, nullable=True)
     updated_at = Column(DateTime, default=lambda: datetime.datetime.now(WIB))
@@ -58,6 +58,15 @@ class Achievement(Base):
     unlocked_at = Column(DateTime, default=lambda: datetime.datetime.now(WIB))
     last_updated_at = Column(DateTime, default=lambda: datetime.datetime.now(WIB))
 
+class Reminder(Base):
+    __tablename__ = 'reminders'
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'))
+    message = Column(String)
+    remind_at = Column(DateTime)
+    status = Column(String, default='pending')
+    created_at = Column(DateTime, default=lambda: datetime.datetime.now(WIB))
+
 class TimeLog(Base):
     __tablename__ = 'timelogs'
     id = Column(Integer, primary_key=True)
@@ -70,25 +79,11 @@ class TimeLog(Base):
     tag = Column(String, nullable=True)
     notes = Column(String, nullable=True)
 
-class FuturePlan(Base):
-    __tablename__ = 'future_plans'
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey('users.id'))
-    activity = Column(String)
-    planned_start = Column(DateTime)
-    planned_end = Column(DateTime, nullable=True)
-    status = Column(String, default='pending') # pending, completed, cancelled
-    created_at = Column(DateTime, default=lambda: datetime.datetime.now(WIB))
-
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ... imports ...
-
-# Database Setup
-# Use DATABASE_URL if available (Supabase), else fallback to SQLite
 database_url = os.getenv('DATABASE_URL')
 if not database_url:
     database_url = 'sqlite:///lifeos.db'
@@ -99,7 +94,6 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 def init_db():
     Base.metadata.create_all(bind=engine)
-    # Create default user for MVP if not exists
     session = SessionLocal()
     if not session.query(User).first():
         default_user = User(name="User")
