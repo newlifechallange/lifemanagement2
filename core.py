@@ -234,7 +234,13 @@ class LifeOSCore:
                     h, m = map(int, str(end_str).split(':'))
                     end_dt = start_dt.replace(hour=h, minute=m)
                     if end_dt < start_dt: end_dt += datetime.timedelta(days=1)
-            elif minutes: end_dt = start_dt + datetime.timedelta(minutes=int(minutes))
+            elif minutes:
+                # Extract only digits from the minutes string (e.g. "30 min" -> 30)
+                clean_mins = "".join(filter(str.isdigit, str(minutes)))
+                if not clean_mins: return False
+                mins_val = int(clean_mins)
+                if "hour" in str(minutes).lower() and mins_val < 24: mins_val *= 60
+                end_dt = start_dt + datetime.timedelta(minutes=mins_val)
             else: return False
             if end_dt.tzinfo is None: end_dt = WIB.localize(end_dt)
             duration = int((end_dt - start_dt).total_seconds() / 60)
