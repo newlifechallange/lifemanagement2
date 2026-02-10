@@ -173,14 +173,27 @@ class LifeOSCore:
             if res_text.endswith("```"): res_text = res_text[:-3]
             result = json.loads(res_text.strip())
 
+            failed_actions = []
             for act in result.get("actions", []):
                 act_type = act.get("type")
                 data = act.get("data", {})
-                if act_type == "LOG_TIME": self.execute_log_time(user_id, data)
-                elif act_type == "UPDATE_STATE": self.execute_update_state(user_id, data)
-                elif act_type == "DELETE": self.execute_delete(user_id, data)
-                elif act_type == "UNLOCK_ACHIEVEMENT": self.execute_unlock_achievement(user_id, data)
-                elif act_type == "SCHEDULE_REMINDER": self.execute_schedule_reminder(user_id, data)
+                try:
+                    if act_type == "LOG_TIME":
+                        if not self.execute_log_time(user_id, data):
+                            failed_actions.append(f"Time Log: {data.get('activity', 'Unknown')}")
+                    elif act_type == "UPDATE_STATE":
+                        self.execute_update_state(user_id, data)
+                    elif act_type == "DELETE":
+                        self.execute_delete(user_id, data)
+                    elif act_type == "UNLOCK_ACHIEVEMENT":
+                        self.execute_unlock_achievement(user_id, data)
+                    elif act_type == "SCHEDULE_REMINDER":
+                        self.execute_schedule_reminder(user_id, data)
+                except Exception as e:
+                    failed_actions.append(f"{act_type} (Error: {str(e)})")
+
+            if failed_actions:
+                result['response_text'] += "\n\n⚠️ **WARNING:** Not saved: " + ", ".join(failed_actions)
 
             supabase.table('chat_history').insert({"user_id": user_id, "role": "assistant", "content": result['response_text'], "created_at": datetime.datetime.now(WIB).isoformat()}).execute()
             return result
@@ -191,41 +204,45 @@ class LifeOSCore:
 
     def execute_schedule_reminder(self, user_id, data):
         try:
-            remind_at = datetime.datetime.fromisoformat(data['remind_at'])
+            remind_str = data.get('remind_at')
+            if not remind_str: return
+            remind_at = datetime.datetime.fromisoformat(remind_str)
             if remind_at.tzinfo is None: remind_at = WIB.localize(remind_at)
-            supabase.table('reminders').insert({
-                "user_id": user_id,
-                "message": data['message'],
-                "remind_at": remind_at.isoformat(),
-                "status": 'pending'
-            }).execute()
+            now = datetime.datetime.now(WIB)
+            if remind_at < now - datetime.timedelta(hours=1):
+                remind_at = remind_at.replace(year=now.year, month=now.month, day=now.day)
+            supabase.table('reminders').insert({"user_id": user_id, "message": data['message'], "remind_at": remind_at.isoformat(), "status": 'pending'}).execute()
         except Exception as e: print(f"Reminder Error: {e}")
 
     def execute_log_time(self, user_id, data):
         try:
             start_str = data.get('start_time') or data.get('start')
-            end_str = data.get('end_time')
-            minutes = data.get('minutes')
-            if not start_str: return
+            end_str = data.get('end_time') or data.get('end')
+            minutes = data.get('minutes') or data.get('duration')
+            activity = data.get('activity') or "Unspecified Activity"
+            if not start_str: return False
             now = datetime.datetime.now(WIB)
-            if "T" in start_str: start_dt = datetime.datetime.fromisoformat(start_str)
+            if "T" in str(start_str): start_dt = datetime.datetime.fromisoformat(str(start_str))
             else:
-                h, m = map(int, start_str.split(':'))
+                h, m = map(int, str(start_str).split(':'))
                 start_dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
                 if start_dt > now + datetime.timedelta(minutes=30): start_dt -= datetime.timedelta(days=1)
             if start_dt.tzinfo is None: start_dt = WIB.localize(start_dt)
             if end_str:
-                if "T" in end_str: end_dt = datetime.datetime.fromisoformat(end_str)
+                if "T" in str(end_str): end_dt = datetime.datetime.fromisoformat(str(end_str))
                 else:
-                    h, m = map(int, end_str.split(':'))
+                    h, m = map(int, str(end_str).split(':'))
                     end_dt = start_dt.replace(hour=h, minute=m)
                     if end_dt < start_dt: end_dt += datetime.timedelta(days=1)
             elif minutes: end_dt = start_dt + datetime.timedelta(minutes=int(minutes))
-            else: return
+            else: return False
             if end_dt.tzinfo is None: end_dt = WIB.localize(end_dt)
             duration = int((end_dt - start_dt).total_seconds() / 60)
-            supabase.table('timelogs').insert({"user_id": user_id, "activity": data.get('activity'), "start_time": start_dt.isoformat(), "end_time": end_dt.isoformat(), "duration_minutes": duration, "category": data.get('category'), "tag": data.get('tag'), "notes": data.get('notes')}).execute()
-        except Exception as e: print(f"Log Time Error: {e}")
+            res = supabase.table('timelogs').insert({"user_id": user_id, "activity": activity, "start_time": start_dt.isoformat(), "end_time": end_dt.isoformat(), "duration_minutes": duration, "category": data.get('category'), "tag": data.get('tag'), "notes": data.get('notes')}).execute()
+            return True if res.data else False
+        except Exception as e: 
+            print(f"Log Error: {e}")
+            return False
 
     def execute_update_state(self, user_id, data):
         try:
@@ -255,15 +272,11 @@ class LifeOSCore:
     def check_gaps_and_notify(self, user_id):
         try:
             now_wib = datetime.datetime.now(WIB)
-            
-            # --- 1. REMINDER CHECK ---
             reminders = supabase.table('reminders').select("*").eq('user_id', user_id).eq('status', 'pending').lte('remind_at', now_wib.isoformat()).execute().data
             if reminders:
                 r = reminders[0]
                 supabase.table('reminders').update({"status": "sent"}).eq('id', r['id']).execute()
                 return f"🔔 **Reminder:** {r['message']}"
-
-            # --- 2. GAP CHECK ---
             if now_wib.hour < 7: return None
             midnight = now_wib.replace(hour=0, minute=0, second=0, microsecond=0)
             logs = supabase.table('timelogs').select("*").eq('user_id', user_id).gte('start_time', midnight.isoformat()).order('start_time', desc=False).execute().data
@@ -280,7 +293,6 @@ class LifeOSCore:
                 if log_end > current_pointer: current_pointer = log_end
             final_gap_minutes = (check_end_boundary - current_pointer).total_seconds() / 60
             if final_gap_minutes > 60: gaps.append({"start": current_pointer, "end": check_end_boundary, "minutes": int(final_gap_minutes)})
-            
             if not gaps: return None
             if len(gaps) == 1:
                 g = gaps[0]
