@@ -139,9 +139,10 @@ class LifeOSCore:
             RULES:
             1. 1-MESSAGE-RULE: Provide your entire response in ONE single bubble. Do not split.
             2. LOG_TIME: Log past OR future activities. For future plans, just set the start_time to the future date. IMPORTANT: If the user provides a list of activities, you MUST generate a 'LOG_TIME' action for EACH item. 
+               - Activity Name: Represented by '`' (e.g. `Coding`, `Sleep`). Use this for the 'activity' field.
                - Extract Categories: Represented by '*' (e.g. *Work, *Exercise).
                - Extract Tags: Represented by '#' (e.g. #lifeapp, #urgent).
-               - Use these to fill 'category' and 'tag' fields in 'data'.
+               - Use these to fill 'activity', 'category' and 'tag' fields in 'data'.
             3. SCHEDULE_REMINDER: If user asks to be reminded of something (e.g., "Remind me to work at 9am").
                Data: {{"message": "string", "remind_at": "ISO_TIMESTAMP"}}
             4. UPDATE_STATE: Update user metrics (weight, goals, state). Extract key, value, unit, and notes.
