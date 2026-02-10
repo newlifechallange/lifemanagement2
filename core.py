@@ -71,47 +71,28 @@ class LifeOSCore:
             user_id = user['id']
 
             # --- EMERGENCY COOLDOWN CHECK ---
-            # Check the last message sent BY THE ASSISTANT to this user
             last_msg = supabase.table('chat_history').select('created_at').eq('user_id', user_id).eq('role', 'assistant').order('created_at', desc=True).limit(1).execute()
-            
             if last_msg.data:
                 last_time = datetime.datetime.fromisoformat(last_msg.data[0]['created_at'].replace('Z', '+00:00')).astimezone(WIB)
                 now_time = datetime.datetime.now(WIB)
-                time_diff = (now_time - last_time).total_seconds()
-                
-                # If we replied less than 10 seconds ago, IGNORE this request.
-                if time_diff < 10:
-                    print(f"COOLDOWN ACTIVE: Last reply was {time_diff:.1f}s ago. Ignoring.")
+                if (now_time - last_time).total_seconds() < 10:
                     return {"response_text": "", "action": "NONE", "status": "cooldown"}
 
             # --- ATOMIC DEDUPLICATION ---
             if message_id:
-                # Try to insert user message first. If message_id is unique, 
-                # duplicate attempts will raise an Exception or return error data.
                 try:
                     insert_res = supabase.table('chat_history').insert({
-                        "user_id": user_id, 
-                        "role": "user", 
-                        "content": user_input,
-                        "message_id": message_id, 
-                        "created_at": datetime.datetime.now(WIB).isoformat()
+                        "user_id": user_id, "role": "user", "content": user_input,
+                        "message_id": message_id, "created_at": datetime.datetime.now(WIB).isoformat()
                     }).execute()
-                    
-                    # If insert_res has no data and there's an error code for uniqueness, it's a duplicate.
-                    # But usually with Postgrest, we check if it succeeded.
-                    if not insert_res.data:
-                        return {"response_text": "", "action": "NONE", "status": "duplicate"}
+                    if not insert_res.data: return {"response_text": "", "action": "NONE", "status": "duplicate"}
                 except Exception as db_err:
-                    # Catch Unique Constraint Violation
                     if "duplicate key" in str(db_err).lower() or "unique" in str(db_err).lower():
-                        print(f"Duplicate message {message_id} blocked.")
                         return {"response_text": "", "action": "NONE", "status": "duplicate"}
                     raise db_err
             else:
                  supabase.table('chat_history').insert({
-                    "user_id": user_id, 
-                    "role": "user", 
-                    "content": user_input,
+                    "user_id": user_id, "role": "user", "content": user_input,
                     "created_at": datetime.datetime.now(WIB).isoformat()
                 }).execute()
 
@@ -126,19 +107,12 @@ class LifeOSCore:
                 current_streak = user.get('current_streak', 0)
                 yesterday_str = (now_wib - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
                 new_streak = current_streak + 1 if last_active == yesterday_str else 1
-                
-                supabase.table('users').update({
-                    "last_active_date": today_str,
-                    "current_streak": new_streak
-                }).eq('id', user_id).execute()
-
+                supabase.table('users').update({"last_active_date": today_str, "current_streak": new_streak}).eq('id', user_id).execute()
                 yest_start = (now_wib - datetime.timedelta(days=1)).replace(hour=0, minute=0, second=0).isoformat()
                 yest_end = now_wib.replace(hour=0, minute=0, second=0).isoformat()
                 yest_logs = supabase.table('timelogs').select("*").eq('user_id', user_id).gte('start_time', yest_start).lt('start_time', yest_end).execute().data
-                
                 achievements_res = supabase.table('achievements').select("*").eq('user_id', user_id).execute()
                 existing_achievements = [{"name": a['name'], "tier": a['tier']} for a in achievements_res.data]
-
                 daily_briefing_prompt = f"""
                 [SPECIAL SYSTEM EVENT: FIRST MESSAGE OF THE DAY]
                 - Streak: {new_streak} days!
@@ -164,18 +138,23 @@ class LifeOSCore:
 
             RULES:
             1. 1-MESSAGE-RULE: Provide your entire response in ONE single bubble. Do not split.
-            2. LOG_TIME: Log past OR future activities. For future plans, just set the start_time to the future date.
-            3. UPDATE_STATE: Update user metrics (weight, etc).
-            4. DELETE: Remove logs or attributes.
-            5. UNLOCK_ACHIEVEMENT: Award achievements based on impressive data.
-            6. SUMMARY: When asked to list/summarize timeline, you MUST use 'Recent Activity Logs'. LIST every activity with time/duration. Categorize them.
+            2. LOG_TIME: Log past OR future activities. For future plans, just set the start_time to the future date. IMPORTANT: If the user provides a list of activities, you MUST generate a 'LOG_TIME' action for EACH item. 
+               - Extract Categories: Represented by '*' (e.g. *Work, *Exercise).
+               - Extract Tags: Represented by '#' (e.g. #lifeapp, #urgent).
+               - Use these to fill 'category' and 'tag' fields in 'data'.
+            3. SCHEDULE_REMINDER: If user asks to be reminded of something (e.g., "Remind me to work at 9am").
+               Data: {{"message": "string", "remind_at": "ISO_TIMESTAMP"}}
+            4. UPDATE_STATE: Update user metrics (weight, goals, state). Extract key, value, unit, and notes.
+            5. DELETE: Remove logs or attributes. Provide 'type' (timelog|attribute) and 'id' or 'key'.
+            6. UNLOCK_ACHIEVEMENT: Award achievements based on impressive data.
+            7. SUMMARY: When asked to list/summarize timeline, you MUST use 'Recent Activity Logs'. LIST every activity with time/duration. Categorize them. 
 
             Output Format (JSON ONLY):
             {{
               "response_text": "Detailed categorized list or greeting here...",
               "actions": [
                 {{
-                  "type": "LOG_TIME" | "UPDATE_STATE" | "DELETE" | "QUERY" | "UNLOCK_ACHIEVEMENT",
+                  "type": "LOG_TIME" | "UPDATE_STATE" | "DELETE" | "SCHEDULE_REMINDER" | "UNLOCK_ACHIEVEMENT",
                   "data": {{ ... }}
                 }}
               ]
@@ -184,10 +163,7 @@ class LifeOSCore:
 
             completion = self.client.chat.completions.create(
                 model=self.model_name,
-                messages=[
-                    {"role": "system", "content": system_instruction},
-                    {"role": "user", "content": user_input}
-                ],
+                messages=[{"role": "system", "content": system_instruction}, {"role": "user", "content": user_input}],
                 temperature=0.7,
             )
             
@@ -199,25 +175,30 @@ class LifeOSCore:
             for act in result.get("actions", []):
                 act_type = act.get("type")
                 data = act.get("data", {})
-                if act_type == "LOG_TIME":
-                    self.execute_log_time(user_id, data)
-                elif act_type == "UPDATE_STATE":
-                    self.execute_update_state(user_id, data)
-                elif act_type == "DELETE":
-                    self.execute_delete(user_id, data)
-                elif act_type == "UNLOCK_ACHIEVEMENT":
-                    self.execute_unlock_achievement(user_id, data)
+                if act_type == "LOG_TIME": self.execute_log_time(user_id, data)
+                elif act_type == "UPDATE_STATE": self.execute_update_state(user_id, data)
+                elif act_type == "DELETE": self.execute_delete(user_id, data)
+                elif act_type == "UNLOCK_ACHIEVEMENT": self.execute_unlock_achievement(user_id, data)
+                elif act_type == "SCHEDULE_REMINDER": self.execute_schedule_reminder(user_id, data)
 
-            supabase.table('chat_history').insert({
-                "user_id": user_id, "role": "assistant", "content": result['response_text'],
-                "created_at": datetime.datetime.now(WIB).isoformat()
-            }).execute()
-
+            supabase.table('chat_history').insert({"user_id": user_id, "role": "assistant", "content": result['response_text'], "created_at": datetime.datetime.now(WIB).isoformat()}).execute()
             return result
         except Exception as e:
             import traceback
             traceback.print_exc()
             return {"response_text": f"Error: {str(e)}", "action": "NONE", "data": {}}
+
+    def execute_schedule_reminder(self, user_id, data):
+        try:
+            remind_at = datetime.datetime.fromisoformat(data['remind_at'])
+            if remind_at.tzinfo is None: remind_at = WIB.localize(remind_at)
+            supabase.table('reminders').insert({
+                "user_id": user_id,
+                "message": data['message'],
+                "remind_at": remind_at.isoformat(),
+                "status": 'pending'
+            }).execute()
+        except Exception as e: print(f"Reminder Error: {e}")
 
     def execute_log_time(self, user_id, data):
         try:
@@ -226,8 +207,7 @@ class LifeOSCore:
             minutes = data.get('minutes')
             if not start_str: return
             now = datetime.datetime.now(WIB)
-            if "T" in start_str:
-                start_dt = datetime.datetime.fromisoformat(start_str)
+            if "T" in start_str: start_dt = datetime.datetime.fromisoformat(start_str)
             else:
                 h, m = map(int, start_str.split(':'))
                 start_dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
@@ -243,11 +223,7 @@ class LifeOSCore:
             else: return
             if end_dt.tzinfo is None: end_dt = WIB.localize(end_dt)
             duration = int((end_dt - start_dt).total_seconds() / 60)
-            supabase.table('timelogs').insert({
-                "user_id": user_id, "activity": data.get('activity'), "start_time": start_dt.isoformat(),
-                "end_time": end_dt.isoformat(), "duration_minutes": duration, 
-                "category": data.get('category'), "tag": data.get('tag'), "notes": data.get('notes')
-            }).execute()
+            supabase.table('timelogs').insert({"user_id": user_id, "activity": data.get('activity'), "start_time": start_dt.isoformat(), "end_time": end_dt.isoformat(), "duration_minutes": duration, "category": data.get('category'), "tag": data.get('tag'), "notes": data.get('notes')}).execute()
         except Exception as e: print(f"Log Time Error: {e}")
 
     def execute_update_state(self, user_id, data):
@@ -278,79 +254,42 @@ class LifeOSCore:
     def check_gaps_and_notify(self, user_id):
         try:
             now_wib = datetime.datetime.now(WIB)
-            today_str = now_wib.strftime("%Y-%m-%d")
             
-            # Define Active Window: 6 AM to 9 PM (or current time if earlier)
-            start_hour = 6
-            end_hour = 21
-            
-            # If it's before 7 AM, don't bother checking yet
+            # --- 1. REMINDER CHECK ---
+            reminders = supabase.table('reminders').select("*").eq('user_id', user_id).eq('status', 'pending').lte('remind_at', now_wib.isoformat()).execute().data
+            if reminders:
+                r = reminders[0]
+                supabase.table('reminders').update({"status": "sent"}).eq('id', r['id']).execute()
+                return f"🔔 **Reminder:** {r['message']}"
+
+            # --- 2. GAP CHECK ---
             if now_wib.hour < 7: return None
-            
-            # Upper bound is either 9 PM or NOW (if it's earlier than 9 PM)
-            check_end_time = now_wib if now_wib.hour < end_hour else now_wib.replace(hour=end_hour, minute=0, second=0)
-            check_start_time = now_wib.replace(hour=start_hour, minute=0, second=0, microsecond=0)
-            
-            # Fetch logs for today
-            logs = supabase.table('timelogs').select("*").eq('user_id', user_id).gte('start_time', check_start_time.isoformat()).lt('start_time', check_end_time.isoformat()).order('start_time', desc=False).execute().data
-            
-            # Find Gaps
+            midnight = now_wib.replace(hour=0, minute=0, second=0, microsecond=0)
+            logs = supabase.table('timelogs').select("*").eq('user_id', user_id).gte('start_time', midnight.isoformat()).order('start_time', desc=False).execute().data
+            if not logs: return None
+            first_log_start = datetime.datetime.fromisoformat(logs[0]['start_time'].replace('Z', '+00:00')).astimezone(WIB)
+            current_pointer = first_log_start
+            check_end_boundary = now_wib if now_wib.hour < 21 else now_wib.replace(hour=21, minute=0, second=0)
             gaps = []
-            current_pointer = check_start_time
-            
-            # We need to sort logs by start_time to be sure
-            # (already sorted by DB, but good to be safe if we merge lists)
-            
             for log in logs:
                 log_start = datetime.datetime.fromisoformat(log['start_time'].replace('Z', '+00:00')).astimezone(WIB)
                 log_end = datetime.datetime.fromisoformat(log['end_time'].replace('Z', '+00:00')).astimezone(WIB)
-                
-                # Gap between pointer and this log start?
                 gap_minutes = (log_start - current_pointer).total_seconds() / 60
-                
-                if gap_minutes > 60:
-                    gaps.append({
-                        "start": current_pointer,
-                        "end": log_start,
-                        "minutes": int(gap_minutes)
-                    })
-                
-                # Move pointer to end of this log
-                if log_end > current_pointer:
-                    current_pointer = log_end
-            
-            # Final gap check (from last log to NOW)
-            final_gap_minutes = (check_end_time - current_pointer).total_seconds() / 60
-            if final_gap_minutes > 60:
-                gaps.append({
-                    "start": current_pointer,
-                    "end": check_end_time,
-                    "minutes": int(final_gap_minutes)
-                })
+                if gap_minutes > 60: gaps.append({"start": current_pointer, "end": log_start, "minutes": int(gap_minutes)})
+                if log_end > current_pointer: current_pointer = log_end
+            final_gap_minutes = (check_end_boundary - current_pointer).total_seconds() / 60
+            if final_gap_minutes > 60: gaps.append({"start": current_pointer, "end": check_end_boundary, "minutes": int(final_gap_minutes)})
             
             if not gaps: return None
-            
-            # Logic: 1 Gap -> Warn. 2+ Gaps -> Auto-fill oldest.
             if len(gaps) == 1:
                 g = gaps[0]
                 return f"⚠️ **Gap Detected:** You have a {g['minutes']} min gap between {g['start'].strftime('%H:%M')} and {g['end'].strftime('%H:%M')}. What were you doing?"
-            
             elif len(gaps) >= 2:
-                # Auto-fill the OLDEST gap
                 g_to_fill = gaps[0]
-                
-                self.execute_log_time(user_id, {
-                    "activity": "Unproductive (Auto-filled)",
-                    "category": "Others",
-                    "start_time": g_to_fill['start'].isoformat(),
-                    "end_time": g_to_fill['end'].isoformat(),
-                    "notes": "Auto-filled by Chroniter due to multiple gaps."
-                })
-                
-                return f"⚠️ **Multiple Gaps Detected!**\nI auto-logged {g_to_fill['start'].strftime('%H:%M')}-{g_to_fill['end'].strftime('%H:%M')} as 'Unproductive'.\n\nPlease fill the remaining gap ({gaps[1]['minutes']} min) manually!"
-
+                self.execute_log_time(user_id, {"activity": "Unproductive (Auto-filled)", "category": "Others", "start_time": g_to_fill['start'].isoformat(), "end_time": g_to_fill['end'].isoformat(), "notes": "Auto-filled by Chroniter."})
+                return f"⚠️ **Multiple Gaps!** I auto-filled {g_to_fill['start'].strftime('%H:%M')}-{g_to_fill['end'].strftime('%H:%M')} as 'Unproductive'. Please fill the remaining gap ({gaps[1]['minutes']} min)!"
         except Exception as e:
-            print(f"Gap Check Error: {e}")
+            print(f"Cron Logic Error: {e}")
             return None
 
     def execute_unlock_achievement(self, user_id, data):
