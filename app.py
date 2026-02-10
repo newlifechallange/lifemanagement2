@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify
 from core import LifeOSCore
+from db_client import supabase
 import requests
 import os
 from dotenv import load_dotenv
