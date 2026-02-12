@@ -32,18 +32,34 @@ class LifeOSCore:
         response = supabase.table('users').insert(new_user).execute()
         return response.data[0]
 
-    def get_context(self, user_id: int):
-        # Fetch last 30 logs for context
-        log_res = supabase.table('timelogs').select("*").eq('user_id', user_id).order('start_time', desc=True).limit(30).execute()
+    def get_context(self, user_id: int, user_input: str = ""):
+        # Determine how many logs to fetch based on user query
+        limit = 40
+        now = datetime.datetime.now(WIB)
+        
+        # If user asks for summary, report, or a longer time period, fetch more
+        query_lower = user_input.lower()
+        if any(kw in query_lower for kw in ["summary", "summarize", "report", "history", "list", "all"]):
+            limit = 150
+            
+        if "week" in query_lower:
+            start_of_week = (now - datetime.timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+            log_res = supabase.table('timelogs').select("*").eq('user_id', user_id).gte('start_time', start_of_week.isoformat()).order('start_time', desc=True).limit(200).execute()
+        elif "month" in query_lower:
+            start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            log_res = supabase.table('timelogs').select("*").eq('user_id', user_id).gte('start_time', start_of_month.isoformat()).order('start_time', desc=True).limit(500).execute()
+        else:
+            log_res = supabase.table('timelogs').select("*").eq('user_id', user_id).order('start_time', desc=True).limit(limit).execute()
         
         # Format logs as a readable string list for the AI
         log_strings = []
         for l in log_res.data:
             start = datetime.datetime.fromisoformat(l['start_time'].replace('Z', '+00:00')).astimezone(WIB)
             cat = l.get('category') or "None"
-            log_strings.append(f"- {start.strftime('%Y-%m-%d %H:%M')} | {l['activity']} | Category: {cat} | Duration: {l['duration_minutes']} min")
+            tag = l.get('tag') or ""
+            log_strings.append(f"- {start.strftime('%Y-%m-%d %H:%M')} | {l['activity']} | Category: {cat} | Tag: {tag} | Duration: {l['duration_minutes']} min")
         
-        log_ctx_text = "\n".join(log_strings) if log_strings else "No logs found."
+        log_ctx_text = "\n".join(reversed(log_strings)) if log_strings else "No logs found."
 
         attr_res = supabase.table('attributes').select("*").eq('user_id', user_id).execute()
         attr_context = {a['key']: {"value": a['value'], "unit": a['unit'], "notes": a.get('notes')} for a in attr_res.data}
@@ -76,7 +92,7 @@ class LifeOSCore:
                 last_time = datetime.datetime.fromisoformat(last_msg.data[0]['created_at'].replace('Z', '+00:00')).astimezone(WIB)
                 now_time = datetime.datetime.now(WIB)
                 if (now_time - last_time).total_seconds() < 10:
-                    return {"response_text": "", "action": "NONE", "status": "cooldown"}
+                    return {"response_text": "Please wait a moment before sending another message (cooldown).", "action": "NONE", "status": "cooldown"}
 
             # --- ATOMIC DEDUPLICATION ---
             if message_id:
@@ -96,7 +112,7 @@ class LifeOSCore:
                     "created_at": datetime.datetime.now(WIB).isoformat()
                 }).execute()
 
-            log_ctx, attr_ctx, hist_ctx, chat_ctx = self.get_context(user_id)
+            log_ctx, attr_ctx, hist_ctx, chat_ctx = self.get_context(user_id, user_input)
             now_wib = datetime.datetime.now(WIB)
             today_str = now_wib.strftime("%Y-%m-%d")
             
@@ -123,11 +139,11 @@ class LifeOSCore:
                 """
 
             system_instruction = f"""
-            You are LifeOS. Time: {now_wib.strftime("%Y-%m-%d %H:%M")}
+            You are LifeOS, a personal AI assistant. Time: {now_wib.strftime("%Y-%m-%d %H:%M")}
             User: {user_name}
 
             Context:
-            - Recent Activity Logs:
+            - Recent Activity Logs (Oldest to Newest):
             {log_ctx}
             
             - Attributes: {json.dumps(attr_ctx)}
@@ -148,7 +164,7 @@ class LifeOSCore:
             4. UPDATE_STATE: Update user metrics (weight, goals, state). Extract key, value, unit, and notes.
             5. DELETE: Remove logs or attributes. Provide 'type' (timelog|attribute) and 'id' or 'key'.
             6. UNLOCK_ACHIEVEMENT: Award achievements based on impressive data.
-            7. SUMMARY: When asked to list/summarize timeline, you MUST use 'Recent Activity Logs'. LIST every activity with time/duration. Categorize them. 
+            7. SUMMARY: When asked to summarize or list activity, you MUST be thorough. Look through the 'Recent Activity Logs' provided and provide a detailed breakdown with times, durations, and totals. If the user asks for a specific tag (e.g. #sqr), filter the logs and summarize ONLY those.
 
             Output Format (JSON ONLY):
             {{
@@ -169,8 +185,10 @@ class LifeOSCore:
             )
             
             res_text = completion.choices[0].message.content.strip()
-            if res_text.startswith("```json"): res_text = res_text[7:]
-            if res_text.endswith("```"): res_text = res_text[:-3]
+            # More robust JSON extraction
+            if "{" in res_text and "}" in res_text:
+                res_text = res_text[res_text.find("{"):res_text.rfind("}")+1]
+            
             result = json.loads(res_text.strip())
 
             failed_actions = []
@@ -283,23 +301,44 @@ class LifeOSCore:
                 r = reminders[0]
                 supabase.table('reminders').update({"status": "sent"}).eq('id', r['id']).execute()
                 return f"🔔 **Reminder:** {r['message']}"
+            
             if now_wib.hour < 7: return None
+            
             midnight = now_wib.replace(hour=0, minute=0, second=0, microsecond=0)
             logs = supabase.table('timelogs').select("*").eq('user_id', user_id).gte('start_time', midnight.isoformat()).order('start_time', desc=False).execute().data
-            if not logs: return None
+            
+            check_end_boundary = now_wib if now_wib.hour < 21 else now_wib.replace(hour=21, minute=0, second=0)
+            
+            if not logs:
+                # If no logs today, check gap since 07:00
+                start_boundary = now_wib.replace(hour=7, minute=0, second=0, microsecond=0)
+                if now_wib > start_boundary + datetime.timedelta(minutes=120): # Notify after 2 hours of silence
+                    gap_minutes = int((now_wib - start_boundary).total_seconds() / 60)
+                    return f"⚠️ **Gap Detected:** You haven't logged anything today! You have a {gap_minutes} min gap since 07:00. What have you been doing?"
+                return None
+
             first_log_start = datetime.datetime.fromisoformat(logs[0]['start_time'].replace('Z', '+00:00')).astimezone(WIB)
             current_pointer = first_log_start
-            check_end_boundary = now_wib if now_wib.hour < 21 else now_wib.replace(hour=21, minute=0, second=0)
+            
+            # Also check gap BEFORE the first log (if first log started late)
+            morning_start = now_wib.replace(hour=7, minute=0, second=0, microsecond=0)
+            
             gaps = []
+            if first_log_start > morning_start + datetime.timedelta(minutes=60):
+                gaps.append({"start": morning_start, "end": first_log_start, "minutes": int((first_log_start - morning_start).total_seconds() / 60)})
+
             for log in logs:
                 log_start = datetime.datetime.fromisoformat(log['start_time'].replace('Z', '+00:00')).astimezone(WIB)
                 log_end = datetime.datetime.fromisoformat(log['end_time'].replace('Z', '+00:00')).astimezone(WIB)
                 gap_minutes = (log_start - current_pointer).total_seconds() / 60
                 if gap_minutes > 60: gaps.append({"start": current_pointer, "end": log_start, "minutes": int(gap_minutes)})
                 if log_end > current_pointer: current_pointer = log_end
+            
             final_gap_minutes = (check_end_boundary - current_pointer).total_seconds() / 60
             if final_gap_minutes > 60: gaps.append({"start": current_pointer, "end": check_end_boundary, "minutes": int(final_gap_minutes)})
+            
             if not gaps: return None
+            
             if len(gaps) == 1:
                 g = gaps[0]
                 return f"⚠️ **Gap Detected:** You have a {g['minutes']} min gap between {g['start'].strftime('%H:%M')} and {g['end'].strftime('%H:%M')}. What were you doing?"
