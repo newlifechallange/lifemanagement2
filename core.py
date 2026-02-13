@@ -1,3 +1,8 @@
+# TIMEZONE POLICY:
+# 1. DATABASE: Always store as UTC (Supabase standard).
+# 2. PROCESSING: Convert to WIB (Asia/Jakarta) for all calculations and AI context.
+# 3. DISPLAY: Always show to user in WIB.
+
 import os
 import json
 import datetime
@@ -10,6 +15,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 WIB = pytz.timezone('Asia/Jakarta')
+UTC = pytz.UTC
 
 class LifeOSCore:
     def __init__(self):
@@ -79,10 +85,16 @@ class LifeOSCore:
 
         # Fetch active stopwatches and timers
         stopwatch_res = supabase.table('stopwatches').select("*").eq('user_id', user_id).eq('status', 'running').execute()
-        stopwatch_ctx = [f"{s['label']} (started {s['started_at']})" for s in stopwatch_res.data]
+        stopwatch_ctx = []
+        for s in stopwatch_res.data:
+            s_start = datetime.datetime.fromisoformat(s['started_at'].replace('Z', '+00:00')).astimezone(WIB)
+            stopwatch_ctx.append(f"{s['label']} (started {s_start.strftime('%H:%M')})")
 
         timer_res = supabase.table('timers').select("*").eq('user_id', user_id).eq('status', 'running').execute()
-        timer_ctx = [f"{t['label']} ({t['duration_minutes']}m, started {t['started_at']})" for t in timer_res.data]
+        timer_ctx = []
+        for t in timer_res.data:
+            t_start = datetime.datetime.fromisoformat(t['started_at'].replace('Z', '+00:00')).astimezone(WIB)
+            timer_ctx.append(f"{t['label']} ({t['duration_minutes']}m, started {t_start.strftime('%H:%M')})")
 
         chat_res = supabase.table('chat_history').select("*").eq('user_id', user_id).order('created_at', desc=True).limit(10).execute()
         chat_context = [{"role": c['role'], "content": c['content']} for c in reversed(chat_res.data)]
@@ -240,7 +252,7 @@ class LifeOSCore:
             # Only save assistant response if it's not empty and parsing succeeded enough to have response_text
             final_response = result.get('response_text')
             if final_response:
-                supabase.table('chat_history').insert({"user_id": user_id, "role": "assistant", "content": final_response, "created_at": datetime.datetime.now(WIB).isoformat()}).execute()
+                supabase.table('chat_history').insert({"user_id": user_id, "role": "assistant", "content": final_response, "created_at": datetime.datetime.now(UTC).isoformat()}).execute()
             
             return result
         except Exception as e:
@@ -250,7 +262,12 @@ class LifeOSCore:
 
     def execute_start_stopwatch(self, user_id, data):
         label = data.get('label', 'Unspecified')
-        supabase.table('stopwatches').insert({"user_id": user_id, "label": label, "status": 'running', "started_at": datetime.datetime.now(WIB).isoformat()}).execute()
+        supabase.table('stopwatches').insert({
+            "user_id": user_id, 
+            "label": label, 
+            "status": 'running', 
+            "started_at": datetime.datetime.now(UTC).isoformat()
+        }).execute()
 
     def execute_stop_stopwatch(self, user_id, data):
         label = data.get('label')
@@ -262,8 +279,9 @@ class LifeOSCore:
         
         if res.data:
             sw = res.data[0]
-            start_time = datetime.datetime.fromisoformat(sw['started_at'].replace('Z', '+00:00')).astimezone(WIB)
-            end_time = datetime.datetime.now(WIB)
+            # Parse UTC from DB and convert to WIB for duration calculation
+            start_time_wib = datetime.datetime.fromisoformat(sw['started_at'].replace('Z', '+00:00')).astimezone(WIB)
+            now_wib = datetime.datetime.now(WIB)
             
             if duration_override:
                 try:
@@ -271,16 +289,17 @@ class LifeOSCore:
                     clean_mins = "".join(filter(str.isdigit, str(duration_override)))
                     duration = int(clean_mins)
                 except:
-                    duration = int((end_time - start_time).total_seconds() / 60)
+                    duration = int((now_wib - start_time_wib).total_seconds() / 60)
             else:
-                duration = int((end_time - start_time).total_seconds() / 60)
+                duration = int((now_wib - start_time_wib).total_seconds() / 60)
             
             supabase.table('stopwatches').update({"status": 'stopped'}).eq('id', sw['id']).execute()
             
             log_data = {
                 "activity": sw['label'],
-                "start_time": (end_time - datetime.timedelta(minutes=duration)).isoformat() if duration_override else start_time.isoformat(),
-                "end_time": end_time.isoformat(),
+                # For logging, we use the calculated start_time in WIB as requested for display consistency
+                "start_time": (now_wib - datetime.timedelta(minutes=duration)).isoformat() if duration_override else start_time_wib.isoformat(),
+                "end_time": now_wib.isoformat(),
                 "duration_minutes": duration,
                 "category": data.get('category'),
                 "tag": data.get('tag')
@@ -294,11 +313,11 @@ class LifeOSCore:
         if not timers: return
         
         group_id = str(uuid.uuid4())
-        now = datetime.datetime.now(WIB)
+        now_utc = datetime.datetime.now(UTC)
         
         for i, t_data in enumerate(timers):
             status = 'running' if i == 0 else 'pending'
-            started_at = now.isoformat() if i == 0 else None
+            started_at = now_utc.isoformat() if i == 0 else None
             supabase.table('timers').insert({
                 "user_id": user_id,
                 "label": t_data['label'],
@@ -311,16 +330,18 @@ class LifeOSCore:
 
     def check_timers(self, user_id):
         try:
-            now = datetime.datetime.now(WIB)
+            now_wib = datetime.datetime.now(WIB)
+            now_utc = datetime.datetime.now(UTC)
             # Find running timers
             res = supabase.table('timers').select("*").eq('user_id', user_id).eq('status', 'running').execute()
             
             notifications = []
             for timer in res.data:
-                started_at = datetime.datetime.fromisoformat(timer['started_at'].replace('Z', '+00:00')).astimezone(WIB)
+                # Parse UTC and convert to WIB
+                started_at_wib = datetime.datetime.fromisoformat(timer['started_at'].replace('Z', '+00:00')).astimezone(WIB)
                 duration = datetime.timedelta(minutes=timer['duration_minutes'])
                 
-                if now >= started_at + duration:
+                if now_wib >= started_at_wib + duration:
                     # Timer finished!
                     supabase.table('timers').update({"status": 'completed'}).eq('id', timer['id']).execute()
                     notifications.append(f"⏰ **Timer Finished:** {timer['label']} ({timer['duration_minutes']} min)")
@@ -328,8 +349,8 @@ class LifeOSCore:
                     # Log the timer as activity
                     self.execute_log_time(user_id, {
                         "activity": f"Timer: {timer['label']}",
-                        "start_time": started_at.isoformat(),
-                        "end_time": (started_at + duration).isoformat(),
+                        "start_time": started_at_wib.isoformat(),
+                        "end_time": (started_at_wib + duration).isoformat(),
                         "duration_minutes": timer['duration_minutes'],
                         "category": "Timer"
                     })
@@ -341,7 +362,7 @@ class LifeOSCore:
                             next_timer = next_res.data[0]
                             supabase.table('timers').update({
                                 "status": 'running',
-                                "started_at": now.isoformat()
+                                "started_at": now_utc.isoformat() # Store start in UTC
                             }).eq('id', next_timer['id']).execute()
                             notifications.append(f"⏭️ **Next Timer Started:** {next_timer['label']} ({next_timer['duration_minutes']} min)")
             
@@ -391,7 +412,7 @@ class LifeOSCore:
             else: return False
             if end_dt.tzinfo is None: end_dt = WIB.localize(end_dt)
             duration = int((end_dt - start_dt).total_seconds() / 60)
-            res = supabase.table('timelogs').insert({"user_id": user_id, "activity": activity, "start_time": start_dt.isoformat(), "end_time": end_dt.isoformat(), "duration_minutes": duration, "category": data.get('category'), "tag": data.get('tag'), "notes": data.get('notes')}).execute()
+            res = supabase.table('timelogs').insert({"user_id": user_id, "activity": activity, "start_time": start_dt.astimezone(UTC).isoformat(), "end_time": end_dt.astimezone(UTC).isoformat(), "duration_minutes": duration, "category": data.get('category'), "tag": data.get('tag'), "notes": data.get('notes')}).execute()
             if not res.data:
                 print(f"Log Error: Insert returned no data. Check Supabase RLS policies or triggers.")
                 return False
@@ -403,13 +424,13 @@ class LifeOSCore:
     def execute_update_state(self, user_id, data):
         try:
             existing = supabase.table('attributes').select("*").eq('user_id', user_id).eq('key', data['key']).execute()
-            update_data = {"value": str(data['value']), "unit": data.get('unit'), "notes": data.get('notes'), "updated_at": datetime.datetime.now(WIB).isoformat()}
+            update_data = {"value": str(data['value']), "unit": data.get('unit'), "notes": data.get('notes'), "updated_at": datetime.datetime.now(UTC).isoformat()}
             if existing.data: supabase.table('attributes').update(update_data).eq('id', existing.data[0]['id']).execute()
             else:
                 update_data.update({"user_id": user_id, "key": data['key']})
                 supabase.table('attributes').insert(update_data).execute()
             history_entry = update_data.copy()
-            history_entry["recorded_at"] = datetime.datetime.now(WIB).isoformat()
+            history_entry["recorded_at"] = datetime.datetime.now(UTC).isoformat()
             if 'updated_at' in history_entry: del history_entry['updated_at']
             supabase.table('attribute_history').insert(history_entry).execute()
         except Exception as e: print(f"Update State Error: {e}")
@@ -437,7 +458,7 @@ class LifeOSCore:
             if now_wib.hour < 7: return None
             
             midnight = now_wib.replace(hour=0, minute=0, second=0, microsecond=0)
-            logs = supabase.table('timelogs').select("*").eq('user_id', user_id).gte('start_time', midnight.isoformat()).order('start_time', desc=False).execute().data
+            logs = supabase.table('timelogs').select("*").eq('user_id', user_id).gte('start_time', midnight.astimezone(UTC).isoformat()).order('start_time', desc=False).execute().data
             
             check_end_boundary = now_wib if now_wib.hour < 21 else now_wib.replace(hour=21, minute=0, second=0)
             
@@ -473,7 +494,7 @@ class LifeOSCore:
                 return f"⚠️ **Gap Detected:** You have a {g['minutes']} min gap between {g['start'].strftime('%H:%M')} and {g['end'].strftime('%H:%M')}. What were you doing?"
             elif len(gaps) >= 2:
                 g_to_fill = gaps[0]
-                self.execute_log_time(user_id, {"activity": "Unproductive (Auto-filled)", "category": "Others", "start_time": g_to_fill['start'].isoformat(), "end_time": g_to_fill['end'].isoformat(), "notes": "Auto-filled by Chroniter."})
+                self.execute_log_time(user_id, {"activity": "Unproductive (Auto-filled)", "category": "Others", "start_time": g_to_fill['start'].astimezone(UTC).isoformat(), "end_time": g_to_fill['end'].astimezone(UTC).isoformat(), "notes": "Auto-filled by Chroniter."})
                 return f"⚠️ **Multiple Gaps!** I auto-filled {g_to_fill['start'].strftime('%H:%M')}-{g_to_fill['end'].strftime('%H:%M')} as 'Unproductive'. Please fill the remaining gap ({gaps[1]['minutes']} min)!"
         except Exception as e:
             print(f"Cron Logic Error: {e}")
@@ -487,7 +508,7 @@ class LifeOSCore:
             if existing.data:
                 current_tier = existing.data[0]['tier']
                 if current_tier < existing.data[0]['max_tier']:
-                     supabase.table('achievements').update({"tier": current_tier + 1, "last_updated_at": datetime.datetime.now(WIB).isoformat()}).eq('id', existing.data[0]['id']).execute()
+                     supabase.table('achievements').update({"tier": current_tier + 1, "last_updated_at": datetime.datetime.now(UTC).isoformat()}).eq('id', existing.data[0]['id']).execute()
             else:
-                supabase.table('achievements').insert({"user_id": user_id, "name": name, "icon": data.get('icon', '🏆'), "description": data.get('description'), "tier": 1}).execute()
+                supabase.table('achievements').insert({"user_id": user_id, "name": name, "icon": data.get('icon', '🏆'), "description": data.get('description'), "tier": 1, "last_updated_at": datetime.datetime.now(UTC).isoformat()}).execute()
         except Exception as e: print(f"Achievement Error: {e}")
