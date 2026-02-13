@@ -79,6 +79,27 @@ class TimeLog(Base):
     tag = Column(String, nullable=True)
     notes = Column(String, nullable=True)
 
+class Stopwatch(Base):
+    __tablename__ = 'stopwatches'
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'))
+    label = Column(String)
+    started_at = Column(DateTime, default=lambda: datetime.datetime.now(WIB))
+    status = Column(String, default='running')
+    created_at = Column(DateTime, default=lambda: datetime.datetime.now(WIB))
+
+class Timer(Base):
+    __tablename__ = 'timers'
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'))
+    label = Column(String)
+    duration_minutes = Column(Integer)
+    started_at = Column(DateTime, nullable=True)
+    status = Column(String, default='pending')
+    sequence_group_id = Column(String, nullable=True)
+    sequence_order = Column(Integer)
+    created_at = Column(DateTime, default=lambda: datetime.datetime.now(WIB))
+
 import os
 from dotenv import load_dotenv
 
