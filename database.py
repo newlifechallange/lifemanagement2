@@ -100,6 +100,18 @@ class Timer(Base):
     sequence_order = Column(Integer)
     created_at = Column(DateTime, default=lambda: datetime.datetime.now(WIB))
 
+class ScheduledTask(Base):
+    __tablename__ = 'scheduled_tasks'
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'))
+    message = Column(String)
+    frequency_minutes = Column(Integer)
+    start_hour_wib = Column(Integer, default=0)
+    end_hour_wib = Column(Integer, default=23)
+    next_run_at = Column(DateTime)
+    status = Column(String, default='active')
+    created_at = Column(DateTime, default=lambda: datetime.datetime.now(WIB))
+
 import os
 from dotenv import load_dotenv
 
