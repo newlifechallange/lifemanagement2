@@ -127,7 +127,7 @@ class LifeOSCore:
         chat_res = supabase.table('chat_history').select("*").eq('user_id', user_id).order('created_at', desc=True).limit(10).execute()
         chat_context = [{"role": c['role'], "content": c['content']} for c in reversed(chat_res.data)]
 
-        return log_ctx_text, attr_context, history_context, chat_context, stopwatch_ctx, timer_ctx, schedule_ctx, unlogged_ctx
+        return log_ctx_text, attr_context, history_context, chat_context, stopwatch_ctx, timer_ctx, schedule_ctx
 
     def process_message(self, user_input, phone_number, user_name, message_id=None):
         try:
@@ -160,7 +160,7 @@ class LifeOSCore:
                     "created_at": datetime.datetime.now(UTC).isoformat()
                 }).execute()
 
-            log_ctx, attr_ctx, hist_ctx, chat_ctx, stopwatch_ctx, timer_ctx, schedule_ctx, unlogged_ctx = self.get_context(user_id, user_input)
+            log_ctx, attr_ctx, hist_ctx, chat_ctx, stopwatch_ctx, timer_ctx, schedule_ctx = self.get_context(user_id, user_input)
             now_wib = datetime.datetime.now(WIB)
             today_str = now_wib.strftime("%Y-%m-%d")
             
@@ -195,25 +195,23 @@ class LifeOSCore:
             - TIMELOGS: {log_ctx}
             - ACTIVE_STOPWATCHES: {json.dumps(stopwatch_ctx)}
             - ACTIVE_TIMERS: {json.dumps(timer_ctx)}
-            - UNLOGGED_SESSIONS: {json.dumps(unlogged_ctx)}
             - SCHEDULES: {json.dumps(schedule_ctx)}
             - ATTRIBUTES: {json.dumps(attr_ctx)}
 
             COMMAND RULES:
             1. DATABASE-TONE: Your 'response_text' MUST be a raw data report or a direct question. No fluff.
-            2. START_STOPWATCH: Use to begin tracking. Data: {{"label": "string", "category": "string", "tag": "string"}}
-            3. STOP_STOPWATCH: Use to end tracking. Must match label from ACTIVE_STOPWATCHES. Data: {{"label": "string"}}
-               - After stopping, ask: "Session stopped. Log to timeline? [Yes/No]"
-            4. LOG_SESSION: Use ONLY when user confirms 'Yes' to log a session from UNLOGGED_SESSIONS.
-               - Data: {{"type": "stopwatch"|"timer", "id": int}}
-            5. EXTRACTION:
+            2. AUTO-LOG: When stopping a stopwatch or setting a timer, the session will be AUTOMATICALLY saved to the timeline. Do not ask for confirmation.
+            3. START_STOPWATCH: Data: {{"label": "string", "category": "string", "tag": "string"}}
+            4. STOP_STOPWATCH: Data: {{"label": "string"}}
+            5. START_TIMER: Data: {{"timers": [{{"label": "string", "duration": "minutes", "category": "string", "tag": "string"}}, ...]}}
+            6. EXTRACTION:
                - Labels are inside backticks: `label`
                - Categories start with *: *Category
                - Tags start with #: #tag
 
             Output Format (JSON ONLY):
             {{
-              "response_text": "RAW_REPORT_OR_QUESTION",
+              "response_text": "RAW_REPORT",
               "actions": [{{ "type": "ACTION_TYPE", "data": {{...}} }}]
             }}
             """
@@ -248,46 +246,43 @@ class LifeOSCore:
                     success = False
                     if act_type == "LOG_TIME":
                         success = self.execute_log_time(user_id, data)
-                        if success: receipts.append(f"LOGGED: {data.get('activity')} ({data.get('duration') or data.get('minutes')} min)")
+                        if success: receipts.append(f"INSERT timelog | Activity: {data.get('activity')} | Cat: {data.get('category')} | Tag: {data.get('tag')} | Duration: {data.get('duration') or data.get('minutes')} min")
                     elif act_type == "UPDATE_STATE":
                         self.execute_update_state(user_id, data)
-                        receipts.append(f"UPDATED: {data.get('key')} = {data.get('value')} {data.get('unit', '')}")
+                        receipts.append(f"UPDATE attribute | Key: {data.get('key')} | Value: {data.get('value')} {data.get('unit', '')}")
                         success = True
                     elif act_type == "DELETE":
                         success = self.execute_delete(user_id, data)
-                        if success: receipts.append(f"DELETED: {data.get('type')} {data.get('id') or data.get('ids') or data.get('key')}")
+                        if success: receipts.append(f"DELETE {data.get('type')} | ID/Key: {data.get('id') or data.get('ids') or data.get('key')}")
                     elif act_type == "UNLOCK_ACHIEVEMENT":
                         self.execute_unlock_achievement(user_id, data)
-                        receipts.append(f"ACHIEVEMENT: {data.get('name')}")
+                        receipts.append(f"INSERT achievement | Name: {data.get('name')}")
                         success = True
                     elif act_type == "SCHEDULE_REMINDER":
                         self.execute_schedule_reminder(user_id, data)
-                        receipts.append(f"REMINDER SET: {data.get('message')}")
+                        receipts.append(f"INSERT reminder | Message: {data.get('message')}")
                         success = True
                     elif act_type == "CREATE_SCHEDULE":
                         self.execute_create_schedule(user_id, data)
-                        receipts.append(f"SCHEDULED: {data.get('message')} every {data.get('frequency_minutes')} min")
+                        receipts.append(f"INSERT schedule | Message: {data.get('message')} | Freq: {data.get('frequency_minutes')} min")
                         success = True
                     elif act_type == "START_STOPWATCH":
                         success = self.execute_start_stopwatch(user_id, data)
-                        if success: receipts.append(f"INSERT stopwatch | Label: {data.get('label')}")
+                        if success: receipts.append(f"INSERT stopwatch | Label: {data.get('label')} | Cat: {data.get('category')} | Tag: {data.get('tag')}")
                     elif act_type == "STOP_STOPWATCH":
-                        success, actual_label = self.execute_stop_stopwatch(user_id, data)
-                        if success: receipts.append(f"UPDATE stopwatch | Status: stopped | Label: {actual_label}")
+                        success, receipt_detail = self.execute_stop_stopwatch(user_id, data)
+                        if success: receipts.append(f"STOP & LOG session | {receipt_detail}")
                     elif act_type == "START_TIMER":
                         self.execute_start_timer(user_id, data)
                         receipts.append(f"INSERT timer sequence | Steps: {len(data.get('timers', []))}")
                         success = True
-                    elif act_type == "LOG_SESSION":
-                        success = self.execute_log_session(user_id, data)
-                        if success: receipts.append(f"INSERT timelog | Source: {data.get('type')} ID {data.get('id')}")
                     
                     if not success:
                         failed_actions.append(f"{act_type}: {data.get('activity') or data.get('label') or data.get('message') or data.get('id') or 'Unknown'}")
                 except Exception as e:
                     err_msg = str(e)
                     if "column" in err_msg.lower():
-                        err_msg = "Database schema mismatch. Please run the provided SQL updates in Supabase."
+                        err_msg = "Database schema mismatch. Please run SQL updates."
                     failed_actions.append(f"{act_type} ({err_msg})")
 
             # Finalize response_text with extreme rigidity
@@ -387,6 +382,7 @@ class LifeOSCore:
 
     def execute_stop_stopwatch(self, user_id, data):
         label = data.get('label')
+        duration_override = data.get('duration')
         
         # 1. Try exact match
         query = supabase.table('stopwatches').select("*").eq('user_id', user_id).eq('status', 'running')
@@ -407,13 +403,38 @@ class LifeOSCore:
         
         if res.data:
             sw = res.data[0]
-            # Just stop it. Don't log to timeline yet.
+            start_time_wib = datetime.datetime.fromisoformat(sw['started_at'].replace('Z', '+00:00')).astimezone(WIB)
+            now_wib = datetime.datetime.now(WIB)
+            
+            if duration_override:
+                try:
+                    clean_mins = "".join(filter(str.isdigit, str(duration_override)))
+                    duration = int(clean_mins)
+                except:
+                    duration = int((now_wib - start_time_wib).total_seconds() / 60)
+            else:
+                duration = int((now_wib - start_time_wib).total_seconds() / 60)
+            
+            if duration <= 0: duration = 1
+            
+            # Stop and mark as logged
             supabase.table('stopwatches').update({
                 "status": 'stopped',
                 "ended_at": datetime.datetime.now(UTC).isoformat(),
-                "is_logged": False
+                "is_logged": True
             }).eq('id', sw['id']).execute()
-            return True, sw['label']
+            
+            log_data = {
+                "activity": sw['label'],
+                "start_time": (now_wib - datetime.timedelta(minutes=duration)).isoformat(),
+                "end_time": now_wib.isoformat(),
+                "duration": duration,
+                "category": sw.get('category'),
+                "tag": sw.get('tag')
+            }
+            self.execute_log_time(user_id, log_data)
+            receipt = f"{sw['label']} ({duration} min) [*{sw.get('category') or ''} #{sw.get('tag') or ''}]"
+            return True, receipt
         return False, None
 
     def execute_log_session(self, user_id, data):
@@ -425,7 +446,11 @@ class LifeOSCore:
                 if res.data:
                     sw = res.data[0]
                     start = datetime.datetime.fromisoformat(sw['started_at'].replace('Z', '+00:00')).astimezone(WIB)
-                    end = datetime.datetime.fromisoformat(sw['ended_at'].replace('Z', '+00:00')).astimezone(WIB)
+                    end_str = sw.get('ended_at')
+                    if end_str:
+                        end = datetime.datetime.fromisoformat(end_str.replace('Z', '+00:00')).astimezone(WIB)
+                    else:
+                        end = datetime.datetime.now(WIB)
                     duration = int((end - start).total_seconds() / 60)
                     if duration <= 0: duration = 1
                     
@@ -505,9 +530,20 @@ class LifeOSCore:
                     supabase.table('timers').update({
                         "status": 'completed',
                         "ended_at": now_utc.isoformat(),
-                        "is_logged": False
+                        "is_logged": True
                     }).eq('id', timer['id']).execute()
-                    notifications.append(f"⏰ **Timer Finished:** {timer['label']} ({timer['duration_minutes']} min). Log to timeline? [Yes/No]")
+                    
+                    log_data = {
+                        "activity": f"Timer: {timer['label']}",
+                        "start_time": started_at_wib.isoformat(),
+                        "end_time": (started_at_wib + datetime.timedelta(minutes=timer['duration_minutes'])).isoformat(),
+                        "duration": timer['duration_minutes'],
+                        "category": timer.get('category') or "Timer",
+                        "tag": timer.get('tag')
+                    }
+                    self.execute_log_time(user_id, log_data)
+                    
+                    notifications.append(f"⏰ **Timer Finished & Logged:** {timer['label']} ({timer['duration_minutes']} min) [*{timer.get('category') or ''} #{timer.get('tag') or ''}]")
                     
                     if timer['sequence_group_id']:
                         next_res = supabase.table('timers').select("*").eq('sequence_group_id', timer['sequence_group_id']).eq('sequence_order', timer['sequence_order'] + 1).execute()
