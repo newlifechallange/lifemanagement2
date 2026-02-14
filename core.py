@@ -26,6 +26,18 @@ class LifeOSCore:
         )
         self.model_name = "arcee-ai/trinity-large-preview:free"
 
+    def parse_time(self, t_str):
+        now = datetime.datetime.now(WIB)
+        t_str = str(t_str).strip()
+        if "T" in t_str: return datetime.datetime.fromisoformat(t_str)
+        # Support both 07:00 and 07.00
+        clean_t = t_str.replace('.', ':')
+        try:
+            h, m = map(int, clean_t.split(':'))
+            return now.replace(hour=h, minute=m, second=0, microsecond=0)
+        except:
+            return now
+
     def get_or_create_user(self, phone_number: str, name: str):
         response = supabase.table('users').select("*").eq('phone_number', phone_number).execute()
         if response.data:
@@ -202,7 +214,7 @@ class LifeOSCore:
             1. DATABASE-TONE: Your 'response_text' MUST be a raw data report or a direct question. No fluff.
             2. LOG_TIME: Use to log any activity with a time range or duration. 
                Data: {{"activity": "string", "start_time": "HH:MM", "end_time": "HH:MM", "category": "string", "tag": "string"}}
-            3. START_STOPWATCH: Data: {{"label": "string", "category": "string", "tag": "string"}}
+            3. START_STOPWATCH: Data: {{"label": "string", "start_time": "optional_HH:MM", "category": "string", "tag": "string"}}
             4. STOP_STOPWATCH: Data: {{"label": "string"}} - This session will be AUTOMATICALLY saved to the timeline.
             5. START_TIMER: Data: {{"timers": [{{"label": "string", "duration": "minutes", "category": "string", "tag": "string"}}, ...]}}
             6. EXTRACTION:
@@ -367,6 +379,7 @@ class LifeOSCore:
         label = data.get('label', 'Unspecified')
         category = data.get('category')
         tag = data.get('tag')
+        start_str = data.get('start_time') or data.get('start')
         
         # Check if already running
         existing = supabase.table('stopwatches').select("*").eq('user_id', user_id).eq('label', label).eq('status', 'running').execute()
@@ -374,18 +387,24 @@ class LifeOSCore:
             start_wib = datetime.datetime.fromisoformat(existing.data[0]['started_at'].replace('Z', '+00:00')).astimezone(WIB).strftime('%H.%M')
             return True, start_wib
             
-        now_utc = datetime.datetime.now(UTC)
+        if start_str:
+            start_dt = self.parse_time(start_str)
+            if start_dt.tzinfo is None: start_dt = WIB.localize(start_dt)
+            start_utc = start_dt.astimezone(UTC)
+        else:
+            start_utc = datetime.datetime.now(UTC)
+            
         res = supabase.table('stopwatches').insert({
             "user_id": user_id, 
             "label": label, 
             "category": category,
             "tag": tag,
             "status": 'running', 
-            "started_at": now_utc.isoformat()
+            "started_at": start_utc.isoformat()
         }).execute()
         
         if res.data:
-            start_wib = now_utc.astimezone(WIB).strftime('%H.%M')
+            start_wib = start_utc.astimezone(WIB).strftime('%H.%M')
             return True, start_wib
         return False, None
 
@@ -598,21 +617,12 @@ class LifeOSCore:
             if not start_str: return False, None, None
             
             now = datetime.datetime.now(WIB)
-            
-            def parse_time(t_str):
-                t_str = str(t_str).strip()
-                if "T" in t_str: return datetime.datetime.fromisoformat(t_str)
-                # Support both 07:00 and 07.00
-                clean_t = t_str.replace('.', ':')
-                h, m = map(int, clean_t.split(':'))
-                return now.replace(hour=h, minute=m, second=0, microsecond=0)
-
-            start_dt = parse_time(start_str)
+            start_dt = self.parse_time(start_str)
             if start_dt > now + datetime.timedelta(minutes=30): start_dt -= datetime.timedelta(days=1)
             if start_dt.tzinfo is None: start_dt = WIB.localize(start_dt)
             
             if end_str:
-                end_dt = parse_time(end_str)
+                end_dt = self.parse_time(end_str)
                 if end_dt < start_dt: end_dt += datetime.timedelta(days=1)
             elif minutes:
                 clean_mins = "".join(filter(str.isdigit, str(minutes)))
