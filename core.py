@@ -248,40 +248,36 @@ class LifeOSCore:
                     if act_type == "LOG_TIME":
                         success, start_t, end_t = self.execute_log_time(user_id, data)
                         if success: 
-                            receipts.append(f"INSERT timelog | start time : {start_t} end_time {end_t} activity : {data.get('activity')} category: {data.get('category') or ''} tag: {data.get('tag') or ''}")
+                            receipts.append(f"ACTION: LOG_ACTIVITY [Table: timelogs] => start time : {start_t} end_time {end_t} activity : {data.get('activity')} category: {data.get('category') or ''} tag: {data.get('tag') or ''}")
                     elif act_type == "UPDATE_STATE":
                         self.execute_update_state(user_id, data)
-                        receipts.append(f"UPDATE attribute | Key: {data.get('key')} | Value: {data.get('value')} {data.get('unit', '')}")
+                        receipts.append(f"ACTION: UPDATE_ATTRIBUTE [Table: attributes] => key : {data.get('key')} value: {data.get('value')} unit: {data.get('unit', '')}")
                         success = True
                     elif act_type == "DELETE":
                         success = self.execute_delete(user_id, data)
-                        if success: receipts.append(f"DELETE {data.get('type')} | ID/Key: {data.get('id') or data.get('ids') or data.get('key')}")
+                        if success: receipts.append(f"ACTION: DELETE [Table: {data.get('type')}] => id : {data.get('id') or data.get('ids') or data.get('key')}")
                     elif act_type == "UNLOCK_ACHIEVEMENT":
                         self.execute_unlock_achievement(user_id, data)
-                        receipts.append(f"INSERT achievement | Name: {data.get('name')}")
+                        receipts.append(f"ACTION: ACHIEVEMENT_UNLOCK [Table: achievements] => name : {data.get('name')}")
                         success = True
                     elif act_type == "SCHEDULE_REMINDER":
                         self.execute_schedule_reminder(user_id, data)
-                        receipts.append(f"INSERT reminder | Message: {data.get('message')}")
+                        receipts.append(f"ACTION: REMINDER_SET [Table: reminders] => message : {data.get('message')}")
                         success = True
                     elif act_type == "CREATE_SCHEDULE":
                         self.execute_create_schedule(user_id, data)
-                        receipts.append(f"INSERT schedule | Message: {data.get('message')} | Freq: {data.get('frequency_minutes')} min")
+                        receipts.append(f"ACTION: SCHEDULE_CREATE [Table: scheduled_tasks] => message : {data.get('message')} frequency: {data.get('frequency_minutes')} min")
                         success = True
                     elif act_type == "START_STOPWATCH":
-                        success = self.execute_start_stopwatch(user_id, data)
-                        if success: receipts.append(f"INSERT stopwatch | Label: {data.get('label')} | Cat: {data.get('category')} | Tag: {data.get('tag')}")
+                        success, start_t = self.execute_start_stopwatch(user_id, data)
+                        if success: receipts.append(f"ACTION: STOPWATCH_START [Table: stopwatches] => start time : {start_t} end_time [RUNNING] activity : {data.get('label')} category: {data.get('category') or ''} tag: {data.get('tag') or ''}")
                     elif act_type == "STOP_STOPWATCH":
                         success, info = self.execute_stop_stopwatch(user_id, data)
                         if success: 
-                            receipts.append(f"STOP & LOG session | start time : {info['start'].replace(':', '.')} end_time {info['end'].replace(':', '.')} activity : {info['activity']} category: {info['category']} tag: {info['tag']}")
+                            receipts.append(f"ACTION: STOP_&_LOG_SESSION [Table: timelogs] => start time : {info['start'].replace(':', '.')} end_time {info['end'].replace(':', '.')} activity : {info['activity']} category: {info['category']} tag: {info['tag']}")
                     elif act_type == "START_TIMER":
                         self.execute_start_timer(user_id, data)
-                        receipts.append(f"INSERT timer sequence | Steps: {len(data.get('timers', []))}")
-                        success = True
-                    elif act_type == "START_TIMER":
-                        self.execute_start_timer(user_id, data)
-                        receipts.append(f"INSERT timer sequence | Steps: {len(data.get('timers', []))}")
+                        receipts.append(f"ACTION: TIMER_SEQUENCE_SET [Table: timers] => steps : {len(data.get('timers', []))}")
                         success = True
                     
                     if not success:
@@ -375,17 +371,23 @@ class LifeOSCore:
         # Check if already running
         existing = supabase.table('stopwatches').select("*").eq('user_id', user_id).eq('label', label).eq('status', 'running').execute()
         if existing.data:
-            return True # Already running is considered success
+            start_wib = datetime.datetime.fromisoformat(existing.data[0]['started_at'].replace('Z', '+00:00')).astimezone(WIB).strftime('%H.%M')
+            return True, start_wib
             
+        now_utc = datetime.datetime.now(UTC)
         res = supabase.table('stopwatches').insert({
             "user_id": user_id, 
             "label": label, 
             "category": category,
             "tag": tag,
             "status": 'running', 
-            "started_at": datetime.datetime.now(UTC).isoformat()
+            "started_at": now_utc.isoformat()
         }).execute()
-        return True if res.data else False
+        
+        if res.data:
+            start_wib = now_utc.astimezone(WIB).strftime('%H.%M')
+            return True, start_wib
+        return False, None
 
     def execute_stop_stopwatch(self, user_id, data):
         label = data.get('label')
