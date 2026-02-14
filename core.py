@@ -51,10 +51,10 @@ class LifeOSCore:
             
         if "week" in query_lower:
             start_of_week = (now - datetime.timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-            log_res = supabase.table('timelogs').select("*").eq('user_id', user_id).gte('start_time', start_of_week.isoformat()).order('start_time', desc=True).limit(200).execute()
+            log_res = supabase.table('timelogs').select("*").eq('user_id', user_id).gte('start_time', start_of_week.astimezone(UTC).isoformat()).order('start_time', desc=True).limit(200).execute()
         elif "month" in query_lower:
             start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-            log_res = supabase.table('timelogs').select("*").eq('user_id', user_id).gte('start_time', start_of_month.isoformat()).order('start_time', desc=True).limit(500).execute()
+            log_res = supabase.table('timelogs').select("*").eq('user_id', user_id).gte('start_time', start_of_month.astimezone(UTC).isoformat()).order('start_time', desc=True).limit(500).execute()
         else:
             log_res = supabase.table('timelogs').select("*").eq('user_id', user_id).order('start_time', desc=True).limit(limit).execute()
         
@@ -96,10 +96,14 @@ class LifeOSCore:
             t_start = datetime.datetime.fromisoformat(t['started_at'].replace('Z', '+00:00')).astimezone(WIB)
             timer_ctx.append(f"{t['label']} ({t['duration_minutes']}m, started {t_start.strftime('%H:%M')})")
 
+        # Fetch active scheduled tasks
+        schedule_res = supabase.table('scheduled_tasks').select("*").eq('user_id', user_id).eq('status', 'active').execute()
+        schedule_ctx = [f"Every {s['frequency_minutes']}m: {s['message']} (Active {s['start_hour_wib']}:00-{s['end_hour_wib']}:00 WIB)" for s in schedule_res.data]
+
         chat_res = supabase.table('chat_history').select("*").eq('user_id', user_id).order('created_at', desc=True).limit(10).execute()
         chat_context = [{"role": c['role'], "content": c['content']} for c in reversed(chat_res.data)]
 
-        return log_ctx_text, attr_context, history_context, chat_context, stopwatch_ctx, timer_ctx
+        return log_ctx_text, attr_context, history_context, chat_context, stopwatch_ctx, timer_ctx, schedule_ctx
 
     def process_message(self, user_input, phone_number, user_name, message_id=None):
         try:
@@ -119,7 +123,7 @@ class LifeOSCore:
                 try:
                     insert_res = supabase.table('chat_history').insert({
                         "user_id": user_id, "role": "user", "content": user_input,
-                        "message_id": message_id, "created_at": datetime.datetime.now(WIB).isoformat()
+                        "message_id": message_id, "created_at": datetime.datetime.now(UTC).isoformat()
                     }).execute()
                     if not insert_res.data: return {"response_text": "", "action": "NONE", "status": "duplicate"}
                 except Exception as db_err:
@@ -129,10 +133,10 @@ class LifeOSCore:
             else:
                  supabase.table('chat_history').insert({
                     "user_id": user_id, "role": "user", "content": user_input,
-                    "created_at": datetime.datetime.now(WIB).isoformat()
+                    "created_at": datetime.datetime.now(UTC).isoformat()
                 }).execute()
 
-            log_ctx, attr_ctx, hist_ctx, chat_ctx, stopwatch_ctx, timer_ctx = self.get_context(user_id, user_input)
+            log_ctx, attr_ctx, hist_ctx, chat_ctx, stopwatch_ctx, timer_ctx, schedule_ctx = self.get_context(user_id, user_input)
             now_wib = datetime.datetime.now(WIB)
             today_str = now_wib.strftime("%Y-%m-%d")
             
@@ -170,31 +174,26 @@ class LifeOSCore:
             - Attribute History: {json.dumps(hist_ctx)}
             - Active Stopwatches: {json.dumps(stopwatch_ctx)}
             - Active Timers: {json.dumps(timer_ctx)}
+            - Active Scheduled Tasks: {json.dumps(schedule_ctx)}
             - Chat History: {json.dumps(chat_ctx)}
 
             {daily_briefing_prompt}
 
             RULES:
-            1. 1-MESSAGE-RULE: Provide your entire response in ONE single bubble. Do not split.
-            2. LOG_TIME: Log past OR future activities.
-            3. SCHEDULE_REMINDER: Data: {{"message": "string", "remind_at": "ISO_TIMESTAMP"}}
-            4. UPDATE_STATE: Update user metrics (weight, goals, state).
-            5. DELETE: Remove logs or attributes.
-            6. UNLOCK_ACHIEVEMENT: Award achievements based on impressive data.
-            7. SUMMARY: Provide a thorough breakdown of activities.
-            8. START_STOPWATCH: Start a stopwatch for an activity. Data: {{"label": "string"}}
-            9. STOP_STOPWATCH: Stop a running stopwatch and log the duration. Data: {{"label": "string", "category": "string", "tag": "string"}}
-            10. START_TIMER: Start one or more sequential timers. Data: {{"timers": [{{"label": "string", "duration": minutes}}, ...]}}
+            1. 1-MESSAGE-RULE: Provide your entire response in ONE single bubble.
+            2. LOG_TIME: Log activities.
+            3. SCHEDULE_REMINDER: One-time reminder. Data: {{"message": "string", "remind_at": "ISO_TIMESTAMP"}}
+            4. CREATE_SCHEDULE: Recurring task/reminder. Use for "every X minutes/hours" with an optional active window (exception times).
+               Data: {{"message": "string", "frequency_minutes": int, "start_hour_wib": int, "end_hour_wib": int}}
+               Note: If user says "exception from 21:00 until 06:00", then start_hour_wib=6 and end_hour_wib=21.
+            5. UPDATE_STATE: Metrics/goals.
+            6. DELETE: type 'scheduled_task' or 'timelog' or 'attribute'.
+            7. START_STOPWATCH / STOP_STOPWATCH / START_TIMER.
 
             Output Format (JSON ONLY):
             {{
               "response_text": "...",
-              "actions": [
-                {{
-                  "type": "LOG_TIME" | "UPDATE_STATE" | "DELETE" | "SCHEDULE_REMINDER" | "UNLOCK_ACHIEVEMENT" | "START_STOPWATCH" | "STOP_STOPWATCH" | "START_TIMER",
-                  "data": {{ ... }}
-                }}
-              ]
+              "actions": [{{ "type": "...", "data": {{...}} }}]
             }}
             """
 
@@ -205,7 +204,6 @@ class LifeOSCore:
             )
             
             res_text = completion.choices[0].message.content.strip()
-            # More robust JSON extraction - pick the outermost JSON object
             if "{" in res_text and "}" in res_text:
                 first_brace = res_text.find("{")
                 last_brace = res_text.rfind("}")
@@ -213,7 +211,6 @@ class LifeOSCore:
                 try:
                     result = json.loads(potential_json)
                 except:
-                    # Fallback to finding the JSON block more carefully if nested but broken
                     try:
                         result = json.loads(res_text[res_text.rfind("{"):res_text.rfind("}")+1])
                     except:
@@ -237,6 +234,8 @@ class LifeOSCore:
                         self.execute_unlock_achievement(user_id, data)
                     elif act_type == "SCHEDULE_REMINDER":
                         self.execute_schedule_reminder(user_id, data)
+                    elif act_type == "CREATE_SCHEDULE":
+                        self.execute_create_schedule(user_id, data)
                     elif act_type == "START_STOPWATCH":
                         self.execute_start_stopwatch(user_id, data)
                     elif act_type == "STOP_STOPWATCH":
@@ -249,7 +248,6 @@ class LifeOSCore:
             if failed_actions:
                 result['response_text'] += "\n\n⚠️ **WARNING:** Not saved: " + ", ".join(failed_actions)
 
-            # Only save assistant response if it's not empty and parsing succeeded enough to have response_text
             final_response = result.get('response_text')
             if final_response:
                 supabase.table('chat_history').insert({"user_id": user_id, "role": "assistant", "content": final_response, "created_at": datetime.datetime.now(UTC).isoformat()}).execute()
@@ -259,6 +257,53 @@ class LifeOSCore:
             import traceback
             traceback.print_exc()
             return {"response_text": f"Error: {str(e)}", "action": "NONE", "data": {}}
+
+    def execute_create_schedule(self, user_id, data):
+        freq = int(data.get('frequency_minutes', 60))
+        # Set next_run_at to now + freq
+        next_run = datetime.datetime.now(UTC) + datetime.timedelta(minutes=freq)
+        supabase.table('scheduled_tasks').insert({
+            "user_id": user_id,
+            "message": data['message'],
+            "frequency_minutes": freq,
+            "start_hour_wib": data.get('start_hour_wib', 0),
+            "end_hour_wib": data.get('end_hour_wib', 23),
+            "next_run_at": next_run.isoformat(),
+            "status": 'active'
+        }).execute()
+
+    def check_schedules(self, user_id):
+        try:
+            now_utc = datetime.datetime.now(UTC)
+            now_wib = datetime.datetime.now(WIB)
+            
+            res = supabase.table('scheduled_tasks').select("*").eq('user_id', user_id).eq('status', 'active').lte('next_run_at', now_utc.isoformat()).execute()
+            
+            notifications = []
+            for task in res.data:
+                # Check active window in WIB
+                current_hour = now_wib.hour
+                start_h = task.get('start_hour_wib', 0)
+                end_h = task.get('end_hour_wib', 23)
+                
+                # Handle window wrap (e.g. 06:00 to 21:00)
+                is_active = False
+                if start_h <= end_h:
+                    is_active = start_h <= current_hour < end_h
+                else: # Wrap around midnight
+                    is_active = current_hour >= start_h or current_hour < end_h
+                
+                if is_active:
+                    notifications.append(f"📅 **Scheduled Task:** {task['message']}")
+                
+                # Update next_run_at regardless of whether we notified (to skip window)
+                new_next_run = now_utc + datetime.timedelta(minutes=task['frequency_minutes'])
+                supabase.table('scheduled_tasks').update({"next_run_at": new_next_run.isoformat()}).eq('id', task['id']).execute()
+                
+            return "\n".join(notifications) if notifications else None
+        except Exception as e:
+            print(f"Schedule Check Error: {e}")
+            return None
 
     def execute_start_stopwatch(self, user_id, data):
         label = data.get('label', 'Unspecified')
@@ -279,13 +324,11 @@ class LifeOSCore:
         
         if res.data:
             sw = res.data[0]
-            # Parse UTC from DB and convert to WIB for duration calculation
             start_time_wib = datetime.datetime.fromisoformat(sw['started_at'].replace('Z', '+00:00')).astimezone(WIB)
             now_wib = datetime.datetime.now(WIB)
             
             if duration_override:
                 try:
-                    # Clean the duration string if it contains "min" etc.
                     clean_mins = "".join(filter(str.isdigit, str(duration_override)))
                     duration = int(clean_mins)
                 except:
@@ -297,7 +340,6 @@ class LifeOSCore:
             
             log_data = {
                 "activity": sw['label'],
-                # For logging, we use the calculated start_time in WIB as requested for display consistency
                 "start_time": (now_wib - datetime.timedelta(minutes=duration)).isoformat() if duration_override else start_time_wib.isoformat(),
                 "end_time": now_wib.isoformat(),
                 "duration_minutes": duration,
@@ -332,21 +374,17 @@ class LifeOSCore:
         try:
             now_wib = datetime.datetime.now(WIB)
             now_utc = datetime.datetime.now(UTC)
-            # Find running timers
             res = supabase.table('timers').select("*").eq('user_id', user_id).eq('status', 'running').execute()
             
             notifications = []
             for timer in res.data:
-                # Parse UTC and convert to WIB
                 started_at_wib = datetime.datetime.fromisoformat(timer['started_at'].replace('Z', '+00:00')).astimezone(WIB)
                 duration = datetime.timedelta(minutes=timer['duration_minutes'])
                 
                 if now_wib >= started_at_wib + duration:
-                    # Timer finished!
                     supabase.table('timers').update({"status": 'completed'}).eq('id', timer['id']).execute()
                     notifications.append(f"⏰ **Timer Finished:** {timer['label']} ({timer['duration_minutes']} min)")
                     
-                    # Log the timer as activity
                     self.execute_log_time(user_id, {
                         "activity": f"Timer: {timer['label']}",
                         "start_time": started_at_wib.isoformat(),
@@ -355,14 +393,13 @@ class LifeOSCore:
                         "category": "Timer"
                     })
 
-                    # Check for next timer in sequence
                     if timer['sequence_group_id']:
                         next_res = supabase.table('timers').select("*").eq('sequence_group_id', timer['sequence_group_id']).eq('sequence_order', timer['sequence_order'] + 1).execute()
                         if next_res.data:
                             next_timer = next_res.data[0]
                             supabase.table('timers').update({
                                 "status": 'running',
-                                "started_at": now_utc.isoformat() # Store start in UTC
+                                "started_at": now_utc.isoformat()
                             }).eq('id', next_timer['id']).execute()
                             notifications.append(f"⏭️ **Next Timer Started:** {next_timer['label']} ({next_timer['duration_minutes']} min)")
             
@@ -380,7 +417,7 @@ class LifeOSCore:
             now = datetime.datetime.now(WIB)
             if remind_at < now - datetime.timedelta(hours=1):
                 remind_at = remind_at.replace(year=now.year, month=now.month, day=now.day)
-            supabase.table('reminders').insert({"user_id": user_id, "message": data['message'], "remind_at": remind_at.isoformat(), "status": 'pending'}).execute()
+            supabase.table('reminders').insert({"user_id": user_id, "message": data['message'], "remind_at": remind_at.astimezone(UTC).isoformat(), "status": 'pending'}).execute()
         except Exception as e: print(f"Reminder Error: {e}")
 
     def execute_log_time(self, user_id, data):
@@ -439,6 +476,7 @@ class LifeOSCore:
         try:
             table = ""
             if data.get('type') == 'timelog': table = 'timelogs'
+            elif data.get('type') == 'scheduled_task': table = 'scheduled_tasks'
             elif data.get('type') == 'attribute':
                 if 'key' in data:
                     supabase.table('attributes').delete().eq('user_id', user_id).eq('key', data['key']).execute()
@@ -449,7 +487,7 @@ class LifeOSCore:
     def check_gaps_and_notify(self, user_id):
         try:
             now_wib = datetime.datetime.now(WIB)
-            reminders = supabase.table('reminders').select("*").eq('user_id', user_id).eq('status', 'pending').lte('remind_at', now_wib.isoformat()).execute().data
+            reminders = supabase.table('reminders').select("*").eq('user_id', user_id).eq('status', 'pending').lte('remind_at', now_wib.astimezone(UTC).isoformat()).execute().data
             if reminders:
                 r = reminders[0]
                 supabase.table('reminders').update({"status": "sent"}).eq('id', r['id']).execute()
