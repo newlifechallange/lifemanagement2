@@ -200,9 +200,10 @@ class LifeOSCore:
 
             COMMAND RULES:
             1. DATABASE-TONE: Your 'response_text' MUST be a raw data report or a direct question. No fluff.
-            2. AUTO-LOG: When stopping a stopwatch or setting a timer, the session will be AUTOMATICALLY saved to the timeline. Do not ask for confirmation.
+            2. LOG_TIME: Use to log any activity with a time range or duration. 
+               Data: {{"activity": "string", "start_time": "HH:MM", "end_time": "HH:MM", "category": "string", "tag": "string"}}
             3. START_STOPWATCH: Data: {{"label": "string", "category": "string", "tag": "string"}}
-            4. STOP_STOPWATCH: Data: {{"label": "string"}}
+            4. STOP_STOPWATCH: Data: {{"label": "string"}} - This session will be AUTOMATICALLY saved to the timeline.
             5. START_TIMER: Data: {{"timers": [{{"label": "string", "duration": "minutes", "category": "string", "tag": "string"}}, ...]}}
             6. EXTRACTION:
                - Labels are inside backticks: `label`
@@ -245,8 +246,9 @@ class LifeOSCore:
                 try:
                     success = False
                     if act_type == "LOG_TIME":
-                        success = self.execute_log_time(user_id, data)
-                        if success: receipts.append(f"INSERT timelog | Activity: {data.get('activity')} | Cat: {data.get('category')} | Tag: {data.get('tag')} | Duration: {data.get('duration') or data.get('minutes')} min")
+                        success, start_t, end_t = self.execute_log_time(user_id, data)
+                        if success: 
+                            receipts.append(f"INSERT timelog | start time : {start_t} end_time {end_t} activity : {data.get('activity')} category: {data.get('category') or ''} tag: {data.get('tag') or ''}")
                     elif act_type == "UPDATE_STATE":
                         self.execute_update_state(user_id, data)
                         receipts.append(f"UPDATE attribute | Key: {data.get('key')} | Value: {data.get('value')} {data.get('unit', '')}")
@@ -270,8 +272,13 @@ class LifeOSCore:
                         success = self.execute_start_stopwatch(user_id, data)
                         if success: receipts.append(f"INSERT stopwatch | Label: {data.get('label')} | Cat: {data.get('category')} | Tag: {data.get('tag')}")
                     elif act_type == "STOP_STOPWATCH":
-                        success, receipt_detail = self.execute_stop_stopwatch(user_id, data)
-                        if success: receipts.append(f"STOP & LOG session | {receipt_detail}")
+                        success, info = self.execute_stop_stopwatch(user_id, data)
+                        if success: 
+                            receipts.append(f"STOP & LOG session | start time : {info['start'].replace(':', '.')} end_time {info['end'].replace(':', '.')} activity : {info['activity']} category: {info['category']} tag: {info['tag']}")
+                    elif act_type == "START_TIMER":
+                        self.execute_start_timer(user_id, data)
+                        receipts.append(f"INSERT timer sequence | Steps: {len(data.get('timers', []))}")
+                        success = True
                     elif act_type == "START_TIMER":
                         self.execute_start_timer(user_id, data)
                         receipts.append(f"INSERT timer sequence | Steps: {len(data.get('timers', []))}")
@@ -433,8 +440,14 @@ class LifeOSCore:
                 "tag": sw.get('tag')
             }
             self.execute_log_time(user_id, log_data)
-            receipt = f"{sw['label']} ({duration} min) [*{sw.get('category') or ''} #{sw.get('tag') or ''}]"
-            return True, receipt
+            receipt_info = {
+                "start": start_time_wib.strftime('%H:%M'),
+                "end": now_wib.strftime('%H:%M'),
+                "activity": sw['label'],
+                "category": sw.get('category') or "",
+                "tag": sw.get('tag') or ""
+            }
+            return True, receipt_info
         return False, None
 
     def execute_log_session(self, user_id, data):
@@ -543,7 +556,9 @@ class LifeOSCore:
                     }
                     self.execute_log_time(user_id, log_data)
                     
-                    notifications.append(f"⏰ **Timer Finished & Logged:** {timer['label']} ({timer['duration_minutes']} min) [*{timer.get('category') or ''} #{timer.get('tag') or ''}]")
+                    start_dot = started_at_wib.strftime('%H.%M')
+                    end_dot = (started_at_wib + datetime.timedelta(minutes=timer['duration_minutes'])).strftime('%H.%M')
+                    notifications.append(f"⏰ **Timer Finished & Logged:**\nstart time : {start_dot} end_time {end_dot} activity : {timer['label']} category: {timer.get('category') or ''} tag: {timer.get('tag') or ''}")
                     
                     if timer['sequence_group_id']:
                         next_res = supabase.table('timers').select("*").eq('sequence_group_id', timer['sequence_group_id']).eq('sequence_order', timer['sequence_order'] + 1).execute()
@@ -578,27 +593,33 @@ class LifeOSCore:
             end_str = data.get('end_time') or data.get('end')
             minutes = data.get('minutes') or data.get('duration')
             activity = data.get('activity') or "Unspecified Activity"
-            if not start_str: return False
+            if not start_str: return False, None, None
+            
             now = datetime.datetime.now(WIB)
-            if "T" in str(start_str): start_dt = datetime.datetime.fromisoformat(str(start_str))
-            else:
-                h, m = map(int, str(start_str).split(':'))
-                start_dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
-                if start_dt > now + datetime.timedelta(minutes=30): start_dt -= datetime.timedelta(days=1)
+            
+            def parse_time(t_str):
+                t_str = str(t_str).strip()
+                if "T" in t_str: return datetime.datetime.fromisoformat(t_str)
+                # Support both 07:00 and 07.00
+                clean_t = t_str.replace('.', ':')
+                h, m = map(int, clean_t.split(':'))
+                return now.replace(hour=h, minute=m, second=0, microsecond=0)
+
+            start_dt = parse_time(start_str)
+            if start_dt > now + datetime.timedelta(minutes=30): start_dt -= datetime.timedelta(days=1)
             if start_dt.tzinfo is None: start_dt = WIB.localize(start_dt)
+            
             if end_str:
-                if "T" in str(end_str): end_dt = datetime.datetime.fromisoformat(str(end_str))
-                else:
-                    h, m = map(int, str(end_str).split(':'))
-                    end_dt = start_dt.replace(hour=h, minute=m)
-                    if end_dt < start_dt: end_dt += datetime.timedelta(days=1)
+                end_dt = parse_time(end_str)
+                if end_dt < start_dt: end_dt += datetime.timedelta(days=1)
             elif minutes:
                 clean_mins = "".join(filter(str.isdigit, str(minutes)))
-                if not clean_mins: return False
+                if not clean_mins: return False, None, None
                 mins_val = int(clean_mins)
                 if "hour" in str(minutes).lower() and mins_val < 24: mins_val *= 60
                 end_dt = start_dt + datetime.timedelta(minutes=mins_val)
-            else: return False
+            else: return False, None, None
+            
             if end_dt.tzinfo is None: end_dt = WIB.localize(end_dt)
             
             # Final duration in minutes
@@ -615,14 +636,23 @@ class LifeOSCore:
             if duration <= 0:
                 duration = 1
 
-            res = supabase.table('timelogs').insert({"user_id": user_id, "activity": activity, "start_time": start_dt.astimezone(UTC).isoformat(), "end_time": end_dt.astimezone(UTC).isoformat(), "duration_minutes": duration, "category": data.get('category'), "tag": data.get('tag'), "notes": data.get('notes')}).execute()
+            res = supabase.table('timelogs').insert({
+                "user_id": user_id, 
+                "activity": activity, 
+                "start_time": start_dt.astimezone(UTC).isoformat(), 
+                "end_time": end_dt.astimezone(UTC).isoformat(), 
+                "duration_minutes": duration, 
+                "category": data.get('category'), 
+                "tag": data.get('tag'), 
+                "notes": data.get('notes')
+            }).execute()
+            
             if not res.data:
-                print(f"Log Error: Insert returned no data. Check Supabase RLS policies or triggers.")
-                return False
-            return True
+                return False, None, None
+            return True, start_dt.strftime('%H.%M'), end_dt.strftime('%H.%M')
         except Exception as e: 
             print(f"Log Error: {e}")
-            return False
+            return False, None, None
 
     def execute_update_state(self, user_id, data):
         try:
