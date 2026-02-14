@@ -176,15 +176,21 @@ class LifeOSCore:
 
             RULES:
             1. 1-MESSAGE-RULE: One single bubble response.
-            2. RIGIDITY: Your 'response_text' must be a LITERAL summary of the actions you are taking. 
-               Use labels and values EXACTLY as they appear in the context or your actions.
-            3. LOG_TIME: Use only if not stopping something.
-            4. STOP_STOPWATCH: Use EXACT label from 'Active Stopwatches'.
-            5. VARIABLES: Use placeholders like [ACTIVITY], [DURATION], [VALUE] in 'response_text'.
+            2. RIGIDITY: Your 'response_text' MUST be strictly based on the provided Context or the Actions you take. Use labels and values EXACTLY as they appear.
+            3. SUMMARY/LIST: If user asks to list or summarize, provide a literal list from 'Recent Activity Logs'.
+            4. ACTIONS: 
+               - START_STOPWATCH: Start a stopwatch. Data: {{"label": "string", "category": "string", "tag": "string"}}
+               - STOP_STOPWATCH: Stop a running stopwatch. Must use EXACT label from 'Active Stopwatches'. Data: {{"label": "string", "duration": "optional_int", "category": "string", "tag": "string"}}
+               - START_TIMER: Start sequential timers. Data: {{"timers": [{{"label": "string", "duration": "minutes", "category": "string", "tag": "string"}}, ...]}}
+            5. VARIABLES: Use placeholders like [LABEL], [DURATION], [VALUE] if you need to reference action data.
+            6. EXTRACTION: When user mentions categories (*) or tags (#), extract them for all actions. 
+               - Use '`' for Activity/Label.
+               - Use '*' for Category.
+               - Use '#' for Tag.
 
             Output Format (JSON ONLY):
             {{
-              "response_text": "ACTION: [TYPE] | Label: [LABEL] | Duration: [DURATION] min",
+              "response_text": "LITERAL summary or list here...",
               "actions": [{{ "type": "...", "data": {{...}} }}]
             }}
             """
@@ -242,7 +248,7 @@ class LifeOSCore:
                         success = True
                     elif act_type == "START_STOPWATCH":
                         self.execute_start_stopwatch(user_id, data)
-                        receipts.append(f"STARTED: {data.get('label')}")
+                        receipts.append(f"STARTED STOPWATCH: {data.get('label')}")
                         success = True
                     elif act_type == "STOP_STOPWATCH":
                         success, actual_label = self.execute_stop_stopwatch(user_id, data)
@@ -252,18 +258,30 @@ class LifeOSCore:
                         receipts.append(f"TIMER SEQUENCE: {len(data.get('timers', []))} steps")
                         success = True
                     
-                    if not success and act_type in ["LOG_TIME", "STOP_STOPWATCH"]:
-                        failed_actions.append(f"{act_type}: {data.get('activity') or data.get('label') or 'Unknown'}")
+                    if not success:
+                        failed_actions.append(f"{act_type}: {data.get('activity') or data.get('label') or data.get('message') or 'Unknown'}")
                 except Exception as e:
-                    failed_actions.append(f"{act_type} (Error: {str(e)})")
+                    err_msg = str(e)
+                    if "column" in err_msg.lower():
+                        err_msg = "Database schema mismatch. Please run the provided SQL updates in Supabase."
+                    failed_actions.append(f"{act_type} ({err_msg})")
 
+            # Finalize response_text with extreme rigidity
+            ai_text = result.get('response_text', "").strip()
+            
             if receipts:
                 final_response = "✅ **DATABASE CONFIRMATION:**\n" + "\n".join([f"- {r}" for r in receipts])
+                # If there was a question being answered alongside the action, keep the answer
+                if ai_text and not any(kw in ai_text.lower() for kw in ["action:", "logged", "started", "stopwatch"]):
+                    final_response = f"{final_response}\n\n{ai_text}"
+            elif ai_text:
+                final_response = ai_text
             else:
-                final_response = result.get('response_text', "No database changes recorded.")
+                final_response = "No database changes recorded."
 
             if failed_actions:
-                final_response += "\n\n⚠️ **FAILED TO SAVE:**\n" + "\n".join([f"- {f}" for f in failed_actions])
+                failure_block = "\n\n⚠️ **FAILED TO SAVE:**\n" + "\n".join([f"- {f}" for f in failed_actions])
+                final_response += failure_block
 
             if final_response:
                 supabase.table('chat_history').insert({"user_id": user_id, "role": "assistant", "content": final_response, "created_at": datetime.datetime.now(UTC).isoformat()}).execute()
@@ -324,9 +342,13 @@ class LifeOSCore:
 
     def execute_start_stopwatch(self, user_id, data):
         label = data.get('label', 'Unspecified')
+        category = data.get('category')
+        tag = data.get('tag')
         supabase.table('stopwatches').insert({
             "user_id": user_id, 
             "label": label, 
+            "category": category,
+            "tag": tag,
             "status": 'running', 
             "started_at": datetime.datetime.now(UTC).isoformat()
         }).execute()
@@ -371,12 +393,12 @@ class LifeOSCore:
             supabase.table('stopwatches').update({"status": 'stopped'}).eq('id', sw['id']).execute()
             
             log_data = {
-                "activity": sw['label'], # USE THE LABEL FROM DB (RIGIDITY)
-                "start_time": (now_wib - datetime.timedelta(minutes=duration)).isoformat() if duration_override else start_time_wib.isoformat(),
+                "activity": sw['label'],
+                "start_time": (now_wib - datetime.timedelta(minutes=duration)).isoformat(),
                 "end_time": now_wib.isoformat(),
                 "duration": duration,
-                "category": data.get('category'),
-                "tag": data.get('tag')
+                "category": data.get('category') or sw.get('category'),
+                "tag": data.get('tag') or sw.get('tag')
             }
             self.execute_log_time(user_id, log_data)
             return True, sw['label']
@@ -395,6 +417,8 @@ class LifeOSCore:
             supabase.table('timers').insert({
                 "user_id": user_id,
                 "label": t_data['label'],
+                "category": t_data.get('category'),
+                "tag": t_data.get('tag'),
                 "duration_minutes": t_data['duration'],
                 "status": status,
                 "started_at": started_at,
@@ -421,8 +445,9 @@ class LifeOSCore:
                         "activity": f"Timer: {timer['label']}",
                         "start_time": started_at_wib.isoformat(),
                         "end_time": (started_at_wib + duration).isoformat(),
-                        "duration_minutes": timer['duration_minutes'],
-                        "category": "Timer"
+                        "duration": timer['duration_minutes'],
+                        "category": timer.get('category') or "Timer",
+                        "tag": timer.get('tag')
                     })
 
                     if timer['sequence_group_id']:
