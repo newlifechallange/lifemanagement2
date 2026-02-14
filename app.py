@@ -26,20 +26,28 @@ def check_gaps():
         print(f"Cron Error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
-@app.route('/check-timers', methods=['GET', 'POST'])
-def check_timers():
+@app.route('/check-cron', methods=['GET', 'POST'])
+def check_cron():
     try:
         users = supabase.table('users').select("id, phone_number, name").execute().data
         results = []
         for user in users:
             uid = user['id']
+            # 1. Check Timers
             timer_notif = core.check_timers(uid)
             if timer_notif:
                 send_whatsapp(user['phone_number'], timer_notif)
                 results.append(f"Timer Notified {user['name']}")
+            
+            # 2. Check Scheduled Tasks
+            sched_notif = core.check_schedules(uid)
+            if sched_notif:
+                send_whatsapp(user['phone_number'], sched_notif)
+                results.append(f"Schedule Notified {user['name']}")
+                
         return jsonify({"status": "ok", "results": results}), 200
     except Exception as e:
-        print(f"Timer Cron Error: {e}")
+        print(f"Cron Error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/webhook', methods=['POST'])
