@@ -1,100 +1,732 @@
-from flask import Flask, request, jsonify
-from core import LifeOSCore
-from db_client import supabase
-import requests
+# TIMEZONE POLICY:
+# 1. DATABASE: Always store as UTC (Supabase standard).
+# 2. PROCESSING: Convert to WIB (Asia/Jakarta) for all calculations and AI context.
+# 3. DISPLAY: Always show to user in WIB.
+
 import os
+import json
+import datetime
+import pytz
+import uuid
+from openai import OpenAI
+from db_client import supabase
 from dotenv import load_dotenv
 
 load_dotenv()
 
-app = Flask(__name__)
-core = LifeOSCore()
+WIB = pytz.timezone('Asia/Jakarta')
+UTC = pytz.UTC
 
-@app.route('/check-cron', methods=['GET', 'POST'])
-def check_cron():
-    try:
-        users = supabase.table('users').select("id, phone_number, name").execute().data
-        results = []
-        for user in users:
-            uid = user['id']
-            # 1. Check Timers
-            timer_notif = core.check_timers(uid)
-            if timer_notif:
-                send_whatsapp(user['phone_number'], timer_notif)
-                results.append(f"Timer Notified {user['name']}")
+class LifeOSCore:
+    def __init__(self):
+        # OpenRouter Configuration
+        self.client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=os.getenv("OPENROUTER_API_KEY"),
+        )
+        self.model_name = "arcee-ai/trinity-large-preview:free"
+
+    def parse_time(self, t_str):
+        now = datetime.datetime.now(WIB)
+        t_str = str(t_str).strip()
+        if "T" in t_str: return datetime.datetime.fromisoformat(t_str)
+        # Support both 07:00 and 07.00
+        clean_t = t_str.replace('.', ':')
+        try:
+            h, m = map(int, clean_t.split(':'))
+            return now.replace(hour=h, minute=m, second=0, microsecond=0)
+        except:
+            return now
+
+    def get_or_create_user(self, phone_number: str, name: str):
+        response = supabase.table('users').select("*").eq('phone_number', phone_number).execute()
+        if response.data:
+            return response.data[0]
+        
+        new_user = {
+            "phone_number": phone_number,
+            "name": name,
+            "timezone": "Asia/Jakarta"
+        }
+        response = supabase.table('users').insert(new_user).execute()
+        return response.data[0]
+
+    def get_context(self, user_id: int, user_input: str = ""):
+        # Determine how many logs to fetch based on user query
+        limit = 40
+        now = datetime.datetime.now(WIB)
+        
+        # If user asks for summary, report, or a longer time period, fetch more
+        query_lower = user_input.lower()
+        if any(kw in query_lower for kw in ["summary", "summarize", "report", "history", "list", "all"]):
+            limit = 150
             
-            # 2. Check Scheduled Tasks
-            sched_notif = core.check_schedules(uid)
-            if sched_notif:
-                send_whatsapp(user['phone_number'], sched_notif)
-                results.append(f"Schedule Notified {user['name']}")
-
-            # 3. Check One-time Reminders
-            remind_notif = core.check_reminders(uid)
-            if remind_notif:
-                send_whatsapp(user['phone_number'], remind_notif)
-                results.append(f"Reminder Notified {user['name']}")
+        if "week" in query_lower:
+            start_of_week = (now - datetime.timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+            log_res = supabase.table('timelogs').select("*").eq('user_id', user_id).gte('start_time', start_of_week.astimezone(UTC).isoformat()).order('start_time', desc=True).limit(200).execute()
+        elif "month" in query_lower:
+            start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            log_res = supabase.table('timelogs').select("*").eq('user_id', user_id).gte('start_time', start_of_month.astimezone(UTC).isoformat()).order('start_time', desc=True).limit(500).execute()
+        else:
+            log_res = supabase.table('timelogs').select("*").eq('user_id', user_id).order('start_time', desc=True).limit(limit).execute()
+        
+        # Format logs as a readable string list for the AI
+        log_strings = []
+        for l in log_res.data:
+            start = datetime.datetime.fromisoformat(l['start_time'].replace('Z', '+00:00')).astimezone(WIB)
+            end_str = l.get('end_time')
+            if end_str:
+                end = datetime.datetime.fromisoformat(end_str.replace('Z', '+00:00')).astimezone(WIB)
+                time_range = f"{start.strftime('%H:%M')} - {end.strftime('%H:%M')}"
+            else:
+                time_range = f"{start.strftime('%H:%M')} (Started)"
                 
-        return jsonify({"status": "ok", "results": results}), 200
-    except Exception as e:
-        print(f"Cron Error: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    data = request.json
-    
-    # Fonnte payload extraction
-    phone = data.get('sender')
-    message = data.get('message')
-    name = data.get('name', 'Unknown User')
-    # Fonnte usually sends 'id' for the message. If not, fallback to None (which skips dedup)
-    message_id = data.get('id') 
-
-    if not phone or not message:
-        return jsonify({"status": "ignored", "reason": "no sender or message"}), 200
-
-    print(f"Received message from {name} ({phone}): {message} [ID: {message_id}]")
-
-    try:
-        # Process logic
-        result = core.process_message(message, phone, name, message_id)
-        print(f"DEBUG: process_message result: {result}")
+            cat = l.get('category') or ""
+            tag = l.get('tag') or ""
+            cat_tag = f" [{cat} {tag}]".strip()
+            if cat_tag == "[]" or not cat_tag: cat_tag = ""
+            # Format: [ID] [HH:MM - HH:MM] Activity (Duration min) [Category #Tag]
+            log_strings.append(f"- ID: {l['id']} | [{time_range}] {l['activity']} ({l['duration_minutes']} min){cat_tag}")
         
-        # Check for duplicate or cooldown
-        if result.get("status") == "duplicate":
-            print(f"Skipping duplicate message ID: {message_id}")
-            return jsonify({"status": "duplicate"}), 200
+        log_ctx_text = "\n".join(reversed(log_strings)) if log_strings else "No logs found."
+
+        attr_res = supabase.table('attributes').select("*").eq('user_id', user_id).execute()
+        attr_context = {a['key']: {"value": a['value'], "unit": a['unit'], "notes": a.get('notes')} for a in attr_res.data}
+
+        hist_res = supabase.table('attribute_history').select("*").eq('user_id', user_id).order('recorded_at', desc=True).limit(50).execute()
+        history_context = []
+        for h in hist_res.data:
+            rec = datetime.datetime.fromisoformat(h['recorded_at'].replace('Z', '+00:00')).astimezone(WIB)
+            history_context.append({
+                "key": h['key'],
+                "value": h['value'],
+                "unit": h['unit'],
+                "date": rec.strftime("%Y-%m-%d"),
+                "notes": h.get('notes')
+            })
+
+        # Fetch active stopwatches and timers
+        stopwatch_res = supabase.table('stopwatches').select("*").eq('user_id', user_id).eq('status', 'running').execute()
+        stopwatch_ctx = []
+        for s in stopwatch_res.data:
+            s_start = datetime.datetime.fromisoformat(s['started_at'].replace('Z', '+00:00')).astimezone(WIB)
+            cat_tag = f" [{s.get('category') or ''} {s.get('tag') or ''}]".strip()
+            if cat_tag == "[]": cat_tag = ""
+            stopwatch_ctx.append(f"{s['label']}{cat_tag} (since {s_start.strftime('%H:%M')})")
+
+        timer_res = supabase.table('timers').select("*").eq('user_id', user_id).eq('status', 'running').execute()
+        timer_ctx = []
+        for t in timer_res.data:
+            t_start = datetime.datetime.fromisoformat(t['started_at'].replace('Z', '+00:00')).astimezone(WIB)
+            cat_tag = f" [{t.get('category') or ''} {t.get('tag') or ''}]".strip()
+            if cat_tag == "[]": cat_tag = ""
+            timer_ctx.append(f"{t['label']}{cat_tag} ({t['duration_minutes']}m, since {t_start.strftime('%H:%M')})")
+
+        # Fetch active scheduled tasks
+        schedule_res = supabase.table('scheduled_tasks').select("*").eq('user_id', user_id).eq('status', 'active').execute()
+        schedule_ctx = [f"Every {s['frequency_minutes']}m: {s['message']} (Active {s['start_hour_wib']}:00-{s['end_hour_wib']}:00 WIB)" for s in schedule_res.data]
+
+        # Fetch unlogged stopwatches and timers (stopped but not in timeline)
+        unlogged_sw = supabase.table('stopwatches').select("*").eq('user_id', user_id).eq('status', 'stopped').eq('is_logged', False).execute()
+        unlogged_ctx = []
+        for s in unlogged_sw.data:
+            unlogged_ctx.append(f"STOPWATCH ID: {s['id']} | Label: {s['label']} (Not in timeline)")
+
+        unlogged_t = supabase.table('timers').select("*").eq('user_id', user_id).eq('status', 'completed').eq('is_logged', False).execute()
+        for t in unlogged_t.data:
+            unlogged_ctx.append(f"TIMER ID: {t['id']} | Label: {t['label']} (Not in timeline)")
+
+        chat_res = supabase.table('chat_history').select("*").eq('user_id', user_id).order('created_at', desc=True).limit(10).execute()
+        chat_context = [{"role": c['role'], "content": c['content']} for c in reversed(chat_res.data)]
+
+        return log_ctx_text, attr_context, history_context, chat_context, stopwatch_ctx, timer_ctx, schedule_ctx
+
+    def process_message(self, user_input, phone_number, user_name, message_id=None):
+        try:
+            user = self.get_or_create_user(phone_number, user_name)
+            user_id = user['id']
+
+            # --- EMERGENCY COOLDOWN CHECK ---
+            last_msg = supabase.table('chat_history').select('created_at').eq('user_id', user_id).eq('role', 'assistant').order('created_at', desc=True).limit(1).execute()
+            if last_msg.data:
+                last_time = datetime.datetime.fromisoformat(last_msg.data[0]['created_at'].replace('Z', '+00:00')).astimezone(WIB)
+                now_time = datetime.datetime.now(WIB)
+                if (now_time - last_time).total_seconds() < 10:
+                    return {"response_text": "Please wait a moment before sending another message (cooldown).", "action": "NONE", "status": "cooldown"}
+
+            # --- ATOMIC DEDUPLICATION ---
+            if message_id:
+                try:
+                    insert_res = supabase.table('chat_history').insert({
+                        "user_id": user_id, "role": "user", "content": user_input,
+                        "message_id": message_id, "created_at": datetime.datetime.now(UTC).isoformat()
+                    }).execute()
+                    if not insert_res.data: return {"response_text": "", "action": "NONE", "status": "duplicate"}
+                except Exception as db_err:
+                    if "duplicate key" in str(db_err).lower() or "unique" in str(db_err).lower():
+                        return {"response_text": "", "action": "NONE", "status": "duplicate"}
+                    raise db_err
+            else:
+                 supabase.table('chat_history').insert({
+                    "user_id": user_id, "role": "user", "content": user_input,
+                    "created_at": datetime.datetime.now(UTC).isoformat()
+                }).execute()
+
+            log_ctx, attr_ctx, hist_ctx, chat_ctx, stopwatch_ctx, timer_ctx, schedule_ctx = self.get_context(user_id, user_input)
+            now_wib = datetime.datetime.now(WIB)
+            today_str = now_wib.strftime("%Y-%m-%d")
+            
+            daily_briefing_prompt = ""
+            last_active = user.get('last_active_date')
+            
+            if last_active != today_str:
+                current_streak = user.get('current_streak', 0)
+                yesterday_str = (now_wib - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+                new_streak = current_streak + 1 if last_active == yesterday_str else 1
+                supabase.table('users').update({"last_active_date": today_str, "current_streak": new_streak}).eq('id', user_id).execute()
+                yest_start = (now_wib - datetime.timedelta(days=1)).replace(hour=0, minute=0, second=0).isoformat()
+                yest_end = now_wib.replace(hour=0, minute=0, second=0).isoformat()
+                yest_logs = supabase.table('timelogs').select("*").eq('user_id', user_id).gte('start_time', yest_start).lt('start_time', yest_end).execute().data
+                achievements_res = supabase.table('achievements').select("*").eq('user_id', user_id).execute()
+                existing_achievements = [{"name": a['name'], "tier": a['tier']} for a in achievements_res.data]
+                daily_briefing_prompt = f"""
+                [SPECIAL SYSTEM EVENT: FIRST MESSAGE OF THE DAY]
+                - Streak: {new_streak} days!
+                - Yesterday's Activities: {json.dumps([l['activity'] for l in yest_logs])}
+                - Existing Achievements: {json.dumps(existing_achievements)}
+                INSTRUCTION: Start your response with a brief (max 2-3 sentences) "Start of Day Briefing". 
+                Keep it in the SAME paragraph as your main response.
+                """
+
+            system_instruction = f"""
+            You are LifeOS, a rigid database command-line interface. 
+            Time: {now_wib.strftime("%Y-%m-%d %H:%M")}
+            User: {user_name}
+
+            CONTEXT (DB STATE):
+            - TIMELOGS: {log_ctx}
+            - ACTIVE_STOPWATCHES: {json.dumps(stopwatch_ctx)}
+            - ACTIVE_TIMERS: {json.dumps(timer_ctx)}
+            - SCHEDULES: {json.dumps(schedule_ctx)}
+            - ATTRIBUTES: {json.dumps(attr_ctx)}
+
+            COMMAND RULES:
+            1. DATABASE-TONE: Your 'response_text' MUST be a raw data report or a direct question. No fluff.
+            2. LOG_TIME: Use to log any activity with a time range or duration. 
+               Data: {{"activity": "string", "start_time": "HH:MM", "end_time": "HH:MM", "category": "string", "tag": "string"}}
+            3. START_STOPWATCH: Data: {{"label": "string", "start_time": "optional_HH:MM", "category": "string", "tag": "string"}}
+            4. STOP_STOPWATCH: Data: {{"label": "string"}} - This session will be AUTOMATICALLY saved to the timeline.
+            5. START_TIMER: Data: {{"timers": [{{"label": "string", "duration": "minutes", "category": "string", "tag": "string"}}, ...]}}
+            6. EXTRACTION:
+               - Labels are inside backticks: `label`
+               - Categories start with *: *Category
+               - Tags start with #: #tag
+
+            Output Format (JSON ONLY):
+            {{
+              "response_text": "RAW_REPORT",
+              "actions": [{{ "type": "ACTION_TYPE", "data": {{...}} }}]
+            }}
+            """
+
+            completion = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[{"role": "system", "content": system_instruction}, {"role": "user", "content": user_input}],
+                temperature=0.1,
+            )
+            
+            res_text = completion.choices[0].message.content.strip()
+            if "{" in res_text and "}" in res_text:
+                first_brace = res_text.find("{")
+                last_brace = res_text.rfind("}")
+                potential_json = res_text[first_brace:last_brace+1]
+                try:
+                    result = json.loads(potential_json)
+                except:
+                    try:
+                        result = json.loads(res_text[res_text.rfind("{"):res_text.rfind("}")+1])
+                    except:
+                        result = {"response_text": res_text, "actions": []}
+            else:
+                result = {"response_text": res_text, "actions": []}
+
+            failed_actions = []
+            receipts = []
+            for act in result.get("actions", []):
+                act_type = act.get("type")
+                data = act.get("data", {})
+                try:
+                    success = False
+                    if act_type == "LOG_TIME":
+                        success, start_t, end_t = self.execute_log_time(user_id, data)
+                        if success: 
+                            receipts.append(f"ACTION: LOG_ACTIVITY [Table: timelogs] => start time : {start_t} end_time {end_t} activity : {data.get('activity')} category: {data.get('category') or ''} tag: {data.get('tag') or ''}")
+                    elif act_type == "UPDATE_STATE":
+                        self.execute_update_state(user_id, data)
+                        receipts.append(f"ACTION: UPDATE_ATTRIBUTE [Table: attributes] => key : {data.get('key')} value: {data.get('value')} unit: {data.get('unit', '')}")
+                        success = True
+                    elif act_type == "DELETE":
+                        success = self.execute_delete(user_id, data)
+                        if success: receipts.append(f"ACTION: DELETE [Table: {data.get('type')}] => id : {data.get('id') or data.get('ids') or data.get('key')}")
+                    elif act_type == "UNLOCK_ACHIEVEMENT":
+                        self.execute_unlock_achievement(user_id, data)
+                        receipts.append(f"ACTION: ACHIEVEMENT_UNLOCK [Table: achievements] => name : {data.get('name')}")
+                        success = True
+                    elif act_type == "SCHEDULE_REMINDER":
+                        self.execute_schedule_reminder(user_id, data)
+                        receipts.append(f"ACTION: REMINDER_SET [Table: reminders] => message : {data.get('message')}")
+                        success = True
+                    elif act_type == "CREATE_SCHEDULE":
+                        self.execute_create_schedule(user_id, data)
+                        receipts.append(f"ACTION: SCHEDULE_CREATE [Table: scheduled_tasks] => message : {data.get('message')} frequency: {data.get('frequency_minutes')} min")
+                        success = True
+                    elif act_type == "START_STOPWATCH":
+                        success, start_t = self.execute_start_stopwatch(user_id, data)
+                        if success: receipts.append(f"ACTION: STOPWATCH_START [Table: stopwatches] => start time : {start_t} end_time [RUNNING] activity : {data.get('label')} category: {data.get('category') or ''} tag: {data.get('tag') or ''}")
+                    elif act_type == "STOP_STOPWATCH":
+                        success, info = self.execute_stop_stopwatch(user_id, data)
+                        if success: 
+                            receipts.append(f"ACTION: STOP_&_LOG_SESSION [Table: timelogs] => start time : {info['start'].replace(':', '.')} end_time {info['end'].replace(':', '.')} activity : {info['activity']} category: {info['category']} tag: {info['tag']}")
+                    elif act_type == "START_TIMER":
+                        self.execute_start_timer(user_id, data)
+                        receipts.append(f"ACTION: TIMER_SEQUENCE_SET [Table: timers] => steps : {len(data.get('timers', []))}")
+                        success = True
+                    
+                    if not success:
+                        failed_actions.append(f"{act_type}: {data.get('activity') or data.get('label') or data.get('message') or data.get('id') or 'Unknown'}")
+                except Exception as e:
+                    err_msg = str(e)
+                    if "column" in err_msg.lower():
+                        err_msg = "Database schema mismatch. Please run SQL updates."
+                    failed_actions.append(f"{act_type} ({err_msg})")
+
+            # Finalize response_text with extreme rigidity
+            ai_text = result.get('response_text', "").strip()
+            
+            if receipts:
+                final_response = "✅ **DATABASE CONFIRMATION:**\n" + "\n".join([f"- {r}" for r in receipts])
+                # If there was a question being answered alongside the action, keep the answer
+                # But if the AI text looks like its own action summary, discard it
+                if ai_text and not any(kw in ai_text.lower() for kw in ["action:", "logged", "started", "stopwatch", "timer"]):
+                    final_response = f"{final_response}\n\n{ai_text}"
+            elif ai_text:
+                final_response = ai_text
+            else:
+                final_response = "No database changes recorded."
+
+            if failed_actions:
+                failure_block = "\n\n⚠️ **FAILED TO SAVE:**\n" + "\n".join([f"- {f}" for f in failed_actions])
+                final_response += failure_block
+
+            if final_response:
+                supabase.table('chat_history').insert({"user_id": user_id, "role": "assistant", "content": final_response, "created_at": datetime.datetime.now(UTC).isoformat()}).execute()
+            
+            result['response_text'] = final_response
+            return result
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return {"response_text": f"Error: {str(e)}", "action": "NONE", "data": {}}
+
+    def execute_create_schedule(self, user_id, data):
+        freq = int(data.get('frequency_minutes', 60))
+        # Set next_run_at to now + freq
+        next_run = datetime.datetime.now(UTC) + datetime.timedelta(minutes=freq)
+        supabase.table('scheduled_tasks').insert({
+            "user_id": user_id,
+            "message": data['message'],
+            "frequency_minutes": freq,
+            "start_hour_wib": data.get('start_hour_wib', 0),
+            "end_hour_wib": data.get('end_hour_wib', 23),
+            "next_run_at": next_run.isoformat(),
+            "status": 'active'
+        }).execute()
+
+    def check_schedules(self, user_id):
+        try:
+            now_utc = datetime.datetime.now(UTC)
+            now_wib = datetime.datetime.now(WIB)
+            
+            res = supabase.table('scheduled_tasks').select("*").eq('user_id', user_id).eq('status', 'active').lte('next_run_at', now_utc.isoformat()).execute()
+            
+            notifications = []
+            for task in res.data:
+                # Check active window in WIB
+                current_hour = now_wib.hour
+                start_h = task.get('start_hour_wib', 0)
+                end_h = task.get('end_hour_wib', 23)
+                
+                # Handle window wrap (e.g. 06:00 to 21:00)
+                is_active = False
+                if start_h <= end_h:
+                    is_active = start_h <= current_hour < end_h
+                else: # Wrap around midnight
+                    is_active = current_hour >= start_h or current_hour < end_h
+                
+                if is_active:
+                    notifications.append(f"📅 **Scheduled Task:** {task['message']}")
+                
+                # Update next_run_at regardless of whether we notified (to skip window)
+                new_next_run = now_utc + datetime.timedelta(minutes=task['frequency_minutes'])
+                supabase.table('scheduled_tasks').update({"next_run_at": new_next_run.isoformat()}).eq('id', task['id']).execute()
+                
+            return "\n".join(notifications) if notifications else None
+        except Exception as e:
+            print(f"Schedule Check Error: {e}")
+            return None
+
+    def execute_start_stopwatch(self, user_id, data):
+        label = data.get('label', 'Unspecified')
+        category = data.get('category')
+        tag = data.get('tag')
+        start_str = data.get('start_time') or data.get('start')
         
-        if result.get("status") == "cooldown":
-            print(f"Skipping due to cooldown.")
-            return jsonify({"status": "cooldown"}), 200
+        # Check if already running
+        existing = supabase.table('stopwatches').select("*").eq('user_id', user_id).eq('label', label).eq('status', 'running').execute()
+        if existing.data:
+            start_wib = datetime.datetime.fromisoformat(existing.data[0]['started_at'].replace('Z', '+00:00')).astimezone(WIB).strftime('%H.%M')
+            return True, start_wib
+            
+        if start_str:
+            start_dt = self.parse_time(start_str)
+            if start_dt.tzinfo is None: start_dt = WIB.localize(start_dt)
+            start_utc = start_dt.astimezone(UTC)
+        else:
+            start_utc = datetime.datetime.now(UTC)
+            
+        res = supabase.table('stopwatches').insert({
+            "user_id": user_id, 
+            "label": label, 
+            "category": category,
+            "tag": tag,
+            "status": 'running', 
+            "started_at": start_utc.isoformat()
+        }).execute()
+        
+        if res.data:
+            start_wib = start_utc.astimezone(WIB).strftime('%H.%M')
+            return True, start_wib
+        return False, None
 
-        response_text = result.get('response_text', "Sorry, I couldn't process that.")
+    def execute_stop_stopwatch(self, user_id, data):
+        label = data.get('label')
+        duration_override = data.get('duration')
+        
+        # 1. Try exact match
+        query = supabase.table('stopwatches').select("*").eq('user_id', user_id).eq('status', 'running')
+        if label:
+            res = query.eq('label', label).order('started_at', desc=True).limit(1).execute()
+            if not res.data:
+                # 2. Try partial match
+                all_running = supabase.table('stopwatches').select("*").eq('user_id', user_id).eq('status', 'running').execute()
+                best_match = None
+                for sw in all_running.data:
+                    if label.lower() in sw['label'].lower() or sw['label'].lower() in label.lower():
+                        best_match = sw
+                        break
+                if best_match: res.data = [best_match]
+                else: res = supabase.table('stopwatches').select("*").eq('user_id', user_id).eq('status', 'running').order('started_at', desc=True).limit(1).execute()
+        else:
+            res = query.order('started_at', desc=True).limit(1).execute()
+        
+        if res.data:
+            sw = res.data[0]
+            start_time_wib = datetime.datetime.fromisoformat(sw['started_at'].replace('Z', '+00:00')).astimezone(WIB)
+            now_wib = datetime.datetime.now(WIB)
+            
+            if duration_override:
+                try:
+                    clean_mins = "".join(filter(str.isdigit, str(duration_override)))
+                    duration = int(clean_mins)
+                except:
+                    duration = int((now_wib - start_time_wib).total_seconds() / 60)
+            else:
+                duration = int((now_wib - start_time_wib).total_seconds() / 60)
+            
+            if duration <= 0: duration = 1
+            
+            # Stop and mark as logged
+            supabase.table('stopwatches').update({
+                "status": 'stopped',
+                "ended_at": datetime.datetime.now(UTC).isoformat(),
+                "is_logged": True
+            }).eq('id', sw['id']).execute()
+            
+            log_data = {
+                "activity": sw['label'],
+                "start_time": (now_wib - datetime.timedelta(minutes=duration)).isoformat(),
+                "end_time": now_wib.isoformat(),
+                "duration": duration,
+                "category": sw.get('category'),
+                "tag": sw.get('tag')
+            }
+            self.execute_log_time(user_id, log_data)
+            receipt_info = {
+                "start": start_time_wib.strftime('%H:%M'),
+                "end": now_wib.strftime('%H:%M'),
+                "activity": sw['label'],
+                "category": sw.get('category') or "",
+                "tag": sw.get('tag') or ""
+            }
+            return True, receipt_info
+        return False, None
 
-        # Send reply
-        send_whatsapp(phone, response_text)
-    except Exception as e:
-        print(f"Error processing message: {e}")
-        send_whatsapp(phone, "I encountered an error. Please try again.")
+    def execute_log_session(self, user_id, data):
+        try:
+            stype = data.get('type')
+            sid = data.get('id')
+            if stype == 'stopwatch':
+                res = supabase.table('stopwatches').select("*").eq('id', sid).eq('user_id', user_id).execute()
+                if res.data:
+                    sw = res.data[0]
+                    start = datetime.datetime.fromisoformat(sw['started_at'].replace('Z', '+00:00')).astimezone(WIB)
+                    end_str = sw.get('ended_at')
+                    if end_str:
+                        end = datetime.datetime.fromisoformat(end_str.replace('Z', '+00:00')).astimezone(WIB)
+                    else:
+                        end = datetime.datetime.now(WIB)
+                    duration = int((end - start).total_seconds() / 60)
+                    if duration <= 0: duration = 1
+                    
+                    log_data = {
+                        "activity": sw['label'],
+                        "start_time": start.isoformat(),
+                        "end_time": end.isoformat(),
+                        "duration": duration,
+                        "category": sw.get('category'),
+                        "tag": sw.get('tag')
+                    }
+                    if self.execute_log_time(user_id, log_data):
+                        supabase.table('stopwatches').update({"is_logged": True}).eq('id', sid).execute()
+                        return True
+            elif stype == 'timer':
+                res = supabase.table('timers').select("*").eq('id', sid).eq('user_id', user_id).execute()
+                if res.data:
+                    t = res.data[0]
+                    start = datetime.datetime.fromisoformat(t['started_at'].replace('Z', '+00:00')).astimezone(WIB)
+                    # Timer end time was stored or is now
+                    end_time_str = t.get('ended_at')
+                    if end_time_str:
+                        end = datetime.datetime.fromisoformat(end_time_str.replace('Z', '+00:00')).astimezone(WIB)
+                    else:
+                        end = start + datetime.timedelta(minutes=t['duration_minutes'])
+                    
+                    log_data = {
+                        "activity": f"Timer: {t['label']}",
+                        "start_time": start.isoformat(),
+                        "end_time": end.isoformat(),
+                        "duration": t['duration_minutes'],
+                        "category": t.get('category') or "Timer",
+                        "tag": t.get('tag')
+                    }
+                    if self.execute_log_time(user_id, log_data):
+                        supabase.table('timers').update({"is_logged": True}).eq('id', sid).execute()
+                        return True
+            return False
+        except Exception as e:
+            print(f"Log Session Error: {e}")
+            return False
 
-    return jsonify({"status": "ok"}), 200
+    def execute_start_timer(self, user_id, data):
+        timers = data.get('timers', [])
+        if not timers: return
+        
+        group_id = str(uuid.uuid4())
+        now_utc = datetime.datetime.now(UTC)
+        
+        for i, t_data in enumerate(timers):
+            status = 'running' if i == 0 else 'pending'
+            started_at = now_utc.isoformat() if i == 0 else None
+            supabase.table('timers').insert({
+                "user_id": user_id,
+                "label": t_data['label'],
+                "category": t_data.get('category'),
+                "tag": t_data.get('tag'),
+                "duration_minutes": t_data['duration'],
+                "status": status,
+                "started_at": started_at,
+                "sequence_group_id": group_id,
+                "sequence_order": i
+            }).execute()
 
-def send_whatsapp(target, message):
-    url = "https://api.fonnte.com/send"
-    headers = {
-        "Authorization": os.getenv("FONNTE_TOKEN")
-    }
-    payload = {
-        "target": target,
-        "message": message
-    }
-    try:
-        response = requests.post(url, headers=headers, data=payload)
-        print(f"Fonnte Response: {response.text}")
-    except Exception as e:
-        print(f"Failed to send WhatsApp: {e}")
+    def check_timers(self, user_id):
+        try:
+            now_wib = datetime.datetime.now(WIB)
+            now_utc = datetime.datetime.now(UTC)
+            res = supabase.table('timers').select("*").eq('user_id', user_id).eq('status', 'running').execute()
+            
+            notifications = []
+            for timer in res.data:
+                started_at_wib = datetime.datetime.fromisoformat(timer['started_at'].replace('Z', '+00:00')).astimezone(WIB)
+                duration = datetime.timedelta(minutes=timer['duration_minutes'])
+                
+                if now_wib >= started_at_wib + duration:
+                    supabase.table('timers').update({
+                        "status": 'completed',
+                        "ended_at": now_utc.isoformat(),
+                        "is_logged": True
+                    }).eq('id', timer['id']).execute()
+                    
+                    log_data = {
+                        "activity": f"Timer: {timer['label']}",
+                        "start_time": started_at_wib.isoformat(),
+                        "end_time": (started_at_wib + datetime.timedelta(minutes=timer['duration_minutes'])).isoformat(),
+                        "duration": timer['duration_minutes'],
+                        "category": timer.get('category') or "Timer",
+                        "tag": timer.get('tag')
+                    }
+                    self.execute_log_time(user_id, log_data)
+                    
+                    start_dot = started_at_wib.strftime('%H.%M')
+                    end_dot = (started_at_wib + datetime.timedelta(minutes=timer['duration_minutes'])).strftime('%H.%M')
+                    notifications.append(f"⏰ **Timer Finished & Logged:**\nstart time : {start_dot} end_time {end_dot} activity : {timer['label']} category: {timer.get('category') or ''} tag: {timer.get('tag') or ''}")
+                    
+                    if timer['sequence_group_id']:
+                        next_res = supabase.table('timers').select("*").eq('sequence_group_id', timer['sequence_group_id']).eq('sequence_order', timer['sequence_order'] + 1).execute()
+                        if next_res.data:
+                            next_timer = next_res.data[0]
+                            supabase.table('timers').update({
+                                "status": 'running',
+                                "started_at": now_utc.isoformat()
+                            }).eq('id', next_timer['id']).execute()
+                            notifications.append(f"⏭️ **Next Timer Started:** {next_timer['label']} ({next_timer['duration_minutes']} min)")
+            
+            return "\n".join(notifications) if notifications else None
+        except Exception as e:
+            print(f"Timer Check Error: {e}")
+            return None
 
-if __name__ == '__main__':
-    # No init_db needed with Supabase client (Schema is managed via Dashboard/SQL)
-    app.run(port=5000, debug=True)
+    def execute_schedule_reminder(self, user_id, data):
+        try:
+            remind_str = data.get('remind_at')
+            if not remind_str: return
+            remind_at = datetime.datetime.fromisoformat(remind_str)
+            if remind_at.tzinfo is None: remind_at = WIB.localize(remind_at)
+            now = datetime.datetime.now(WIB)
+            if remind_at < now - datetime.timedelta(hours=1):
+                remind_at = remind_at.replace(year=now.year, month=now.month, day=now.day)
+            supabase.table('reminders').insert({"user_id": user_id, "message": data['message'], "remind_at": remind_at.astimezone(UTC).isoformat(), "status": 'pending'}).execute()
+        except Exception as e: print(f"Reminder Error: {e}")
+
+    def execute_log_time(self, user_id, data):
+        try:
+            start_str = data.get('start_time') or data.get('start')
+            end_str = data.get('end_time') or data.get('end')
+            minutes = data.get('minutes') or data.get('duration')
+            activity = data.get('activity') or "Unspecified Activity"
+            if not start_str: return False, None, None
+            
+            now = datetime.datetime.now(WIB)
+            start_dt = self.parse_time(start_str)
+            if start_dt > now + datetime.timedelta(minutes=30): start_dt -= datetime.timedelta(days=1)
+            if start_dt.tzinfo is None: start_dt = WIB.localize(start_dt)
+            
+            if end_str:
+                end_dt = self.parse_time(end_str)
+                if end_dt < start_dt: end_dt += datetime.timedelta(days=1)
+            elif minutes:
+                clean_mins = "".join(filter(str.isdigit, str(minutes)))
+                if not clean_mins: return False, None, None
+                mins_val = int(clean_mins)
+                if "hour" in str(minutes).lower() and mins_val < 24: mins_val *= 60
+                end_dt = start_dt + datetime.timedelta(minutes=mins_val)
+            else: return False, None, None
+            
+            if end_dt.tzinfo is None: end_dt = WIB.localize(end_dt)
+            
+            # Final duration in minutes
+            if minutes:
+                try:
+                    clean_mins = "".join(filter(str.isdigit, str(minutes)))
+                    duration = int(clean_mins)
+                except:
+                    duration = int((end_dt - start_dt).total_seconds() / 60)
+            else:
+                duration = int((end_dt - start_dt).total_seconds() / 60)
+            
+            # Absolute minimum 1 minute
+            if duration <= 0:
+                duration = 1
+
+            res = supabase.table('timelogs').insert({
+                "user_id": user_id, 
+                "activity": activity, 
+                "start_time": start_dt.astimezone(UTC).isoformat(), 
+                "end_time": end_dt.astimezone(UTC).isoformat(), 
+                "duration_minutes": duration, 
+                "category": data.get('category'), 
+                "tag": data.get('tag'), 
+                "notes": data.get('notes')
+            }).execute()
+            
+            if not res.data:
+                return False, None, None
+            return True, start_dt.strftime('%H.%M'), end_dt.strftime('%H.%M')
+        except Exception as e: 
+            print(f"Log Error: {e}")
+            return False, None, None
+
+    def execute_update_state(self, user_id, data):
+        try:
+            existing = supabase.table('attributes').select("*").eq('user_id', user_id).eq('key', data['key']).execute()
+            update_data = {"value": str(data['value']), "unit": data.get('unit'), "notes": data.get('notes'), "updated_at": datetime.datetime.now(UTC).isoformat()}
+            if existing.data: supabase.table('attributes').update(update_data).eq('id', existing.data[0]['id']).execute()
+            else:
+                update_data.update({"user_id": user_id, "key": data['key']})
+                supabase.table('attributes').insert(update_data).execute()
+            history_entry = update_data.copy()
+            history_entry["recorded_at"] = datetime.datetime.now(UTC).isoformat()
+            if 'updated_at' in history_entry: del history_entry['updated_at']
+            supabase.table('attribute_history').insert(history_entry).execute()
+        except Exception as e: print(f"Update State Error: {e}")
+
+    def execute_delete(self, user_id, data):
+        try:
+            table = ""
+            dtype = data.get('type')
+            if dtype == 'timelog': table = 'timelogs'
+            elif dtype == 'scheduled_task': table = 'scheduled_tasks'
+            elif dtype == 'attribute':
+                if 'key' in data:
+                    supabase.table('attributes').delete().eq('user_id', user_id).eq('key', data['key']).execute()
+                    return True
+            
+            if table:
+                # Handle single ID or list of IDs
+                ids = data.get('id') or data.get('ids')
+                if ids:
+                    if isinstance(ids, list):
+                        res = supabase.table(table).delete().in_('id', ids).eq('user_id', user_id).execute()
+                    else:
+                        res = supabase.table(table).delete().eq('id', ids).eq('user_id', user_id).execute()
+                    return True if res.data else False
+            return False
+        except Exception as e: 
+            print(f"Delete Error: {e}")
+            return False
+
+    def check_reminders(self, user_id):
+        try:
+            now_utc = datetime.datetime.now(UTC)
+            reminders = supabase.table('reminders').select("*").eq('user_id', user_id).eq('status', 'pending').lte('remind_at', now_utc.isoformat()).execute().data
+            if reminders:
+                r = reminders[0]
+                supabase.table('reminders').update({"status": "sent"}).eq('id', r['id']).execute()
+                return f"🔔 **Reminder:** {r['message']}"
+            return None
+        except Exception as e:
+            print(f"Reminder Check Error: {e}")
+            return None
+
+    def execute_unlock_achievement(self, user_id, data):
+        try:
+            name = data.get('name')
+            if not name: return
+            existing = supabase.table('achievements').select("*").eq('user_id', user_id).eq('name', name).execute()
+            if existing.data:
+                current_tier = existing.data[0]['tier']
+                if current_tier < existing.data[0]['max_tier']:
+                     supabase.table('achievements').update({"tier": current_tier + 1, "last_updated_at": datetime.datetime.now(UTC).isoformat()}).eq('id', existing.data[0]['id']).execute()
+            else:
+                supabase.table('achievements').insert({"user_id": user_id, "name": name, "icon": data.get('icon', '🏆'), "description": data.get('description'), "tier": 1, "last_updated_at": datetime.datetime.now(UTC).isoformat()}).execute()
+        except Exception as e: print(f"Achievement Error: {e}")
