@@ -10,22 +10,6 @@ load_dotenv()
 app = Flask(__name__)
 core = LifeOSCore()
 
-@app.route('/check-gaps', methods=['GET', 'POST'])
-def check_gaps():
-    try:
-        users = supabase.table('users').select("id, phone_number, name").execute().data
-        results = []
-        for user in users:
-            uid = user['id']
-            notification = core.check_gaps_and_notify(uid)
-            if notification:
-                send_whatsapp(user['phone_number'], notification)
-                results.append(f"Notified {user['name']}")
-        return jsonify({"status": "ok", "results": results}), 200
-    except Exception as e:
-        print(f"Cron Error: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
 @app.route('/check-cron', methods=['GET', 'POST'])
 def check_cron():
     try:
@@ -44,6 +28,12 @@ def check_cron():
             if sched_notif:
                 send_whatsapp(user['phone_number'], sched_notif)
                 results.append(f"Schedule Notified {user['name']}")
+
+            # 3. Check One-time Reminders
+            remind_notif = core.check_reminders(uid)
+            if remind_notif:
+                send_whatsapp(user['phone_number'], remind_notif)
+                results.append(f"Reminder Notified {user['name']}")
                 
         return jsonify({"status": "ok", "results": results}), 200
     except Exception as e:
